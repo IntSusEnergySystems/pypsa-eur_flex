@@ -277,8 +277,9 @@ def apply_nuclear_capacity(
     ``cps_max``, ``p_nom_min`` is the capacity still online plus new build
     from the previous myopic horizon, and further new build is allowed.
     With ``cps_max``, an EU country is fixed at that country's share of the
-    Current Policies total. Capacity still online, up to that share, is
-    treated as already built. Anything above it is new capacity.
+    Current Policies total. ``p_nom`` and ``p_nom_min`` stay at the capacity
+    already in service, and ``capital_cost`` is left unchanged, so MW above
+    that fleet is new and carries its annualised capital cost.
     """
     available = nuclear_capacity_by_country(powerplants_file, year)
 
@@ -308,11 +309,13 @@ def apply_nuclear_capacity(
         code = str(country)
         if cps_max is not None and code in cps_max.index and pd.notna(cps_max.loc[code]):
             total = max(float(cps_max.loc[code]), 0.0)
-            # p_nom is the part already paid for. The bounds pin the fleet
-            # to the share, so only capacity above the surviving units is new.
+            # Only the fleet already in service is sunk. The share can be
+            # higher: that extra MW stays above p_nom_min, so the annualised
+            # capital cost on the generator applies to it. The country
+            # capacity limit then holds the generator at the share.
             sunk = min(existing, total)
             n.generators.loc[keep, "p_nom"] = sunk
-            n.generators.loc[keep, "p_nom_min"] = total
+            n.generators.loc[keep, "p_nom_min"] = sunk
             n.generators.loc[keep, "p_nom_max"] = total
             n.generators.loc[keep, "p_nom_extendable"] = total > 0
             logger.info(

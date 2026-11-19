@@ -124,8 +124,8 @@ if __name__ == "__main__":
 
     if params.electricity.get("nuclear_fleet", False) and foresight == "myopic":
         # One generator per country. EU countries that have a Current Policies
-        # share are fixed at that share. Other countries keep the fleet still
-        # online, plus new build from the previous myopic horizon.
+        # share are held at that share. The minimum stays at the fleet already
+        # in service, so capacity above it keeps its annualised capital cost.
         powerplants = inputs.powerplants
         if not isinstance(powerplants, str):
             powerplants = list(powerplants)[0]

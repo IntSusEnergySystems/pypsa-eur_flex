@@ -107,14 +107,17 @@ def test_apply_nuclear_capacity_stays_on_the_cps_share(tmp_path):
         n_previous=previous,
         cps_max=pd.Series({"BE": 500.0, "CZ": 2000.0}),
     )
-    # Belgium has no unit left in 2040, so the share is new capacity.
+    # Belgium has no unit left in 2040. The 500 MW is new, so it stays above
+    # p_nom_min and keeps the generator capital cost.
     assert n.generators.loc["BE nuclear", "p_nom"] == 0
-    assert n.generators.loc["BE nuclear", "p_nom_min"] == 500
+    assert n.generators.loc["BE nuclear", "p_nom_min"] == 0
     assert n.generators.loc["BE nuclear", "p_nom_max"] == 500
-    # Czech units still online exceed the share, so the share is already built.
+    assert n.generators.loc["BE nuclear", "capital_cost"] == 100
+    # Czech units still online exceed the share, so no new MW is added.
     assert n.generators.loc["CZ nuclear", "p_nom"] == 2000
     assert n.generators.loc["CZ nuclear", "p_nom_min"] == 2000
     assert n.generators.loc["CZ nuclear", "p_nom_max"] == 2000
+    assert n.generators.loc["CZ nuclear", "capital_cost"] == 100
     # Switzerland is outside the EU table, so earlier new build is kept and
     # further new build stays open. No Swiss unit is in the plant file.
     assert n.generators.loc["CH nuclear", "p_nom_min"] == 500
@@ -284,6 +287,11 @@ def test_cps_config_disables_the_europe_wide_co2_cap():
     assert config["co2_budget_national"]["aggregate"] == "eu"
     assert config["co2_budget_national"]["iea_mt"][2030] == 2661
     assert config["electricity"]["nuclear_fleet"] is True
+    assert set(config["countries"]) == {
+        "AT", "BE", "BG", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB",
+        "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "NL", "PL", "PT",
+        "RO", "SE", "SI", "SK",
+    }
     assert config["solving"]["constraints"]["CCL"] is True
     assert config["sector"]["co2_sequestration_potential"][2050] == 0
     assert config["sector"]["conventional_generation"]["coal"] == "coal"
