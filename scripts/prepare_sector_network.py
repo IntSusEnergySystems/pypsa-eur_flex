@@ -5584,11 +5584,15 @@ def add_aviation(
             f"Changing aviation demand by {demand_factor * 100 - 100:+.2f}%."
         )
 
-    all_aviation = ["total international aviation", "total domestic aviation"]
+    aviation_columns = ["total domestic aviation"]
+    if options.get("exclude_international_bunkers"):
+        logger.info("International aviation is left out of kerosene demand.")
+    else:
+        aviation_columns.append("total international aviation")
 
     p_set = (
         demand_factor
-        * pop_weighted_energy_totals.loc[nodes, all_aviation].sum(axis=1)
+        * pop_weighted_energy_totals.loc[nodes, aviation_columns].sum(axis=1)
         * 1e6
         / nhours
     ).rename(lambda x: x + " kerosene for aviation")
@@ -5680,10 +5684,14 @@ def add_shipping(
     domestic_navigation = pop_weighted_energy_totals.loc[
         nodes, ["total domestic navigation"]
     ].squeeze()
-    international_navigation = (
-        pd.read_csv(shipping_demand_file, index_col=0).squeeze(axis=1) * nyears
-    )
-    all_navigation = domestic_navigation + international_navigation
+    if options.get("exclude_international_bunkers"):
+        logger.info("International shipping is left out of shipping demand.")
+        all_navigation = domestic_navigation
+    else:
+        international_navigation = (
+            pd.read_csv(shipping_demand_file, index_col=0).squeeze(axis=1) * nyears
+        )
+        all_navigation = domestic_navigation + international_navigation
     p_set = all_navigation * 1e6 / nhours
 
     if shipping_hydrogen_share:

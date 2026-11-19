@@ -17,9 +17,11 @@ IEA table is not an EU-plus-neighbours total.
 
 Wind is split into onshore and offshore with the same database. Solar PV and
 CSP are one solar total. Hard coal and lignite are one coal total. Gas is
-one total for OCGT and CCGT. Nuclear is the same EU total, shared each year
-by the capacity still online under the published retirement dates, so the
-country mix changes as units close and the EU sum stays on the CPS total.
+one total for OCGT and CCGT. Hydro is reservoir and run-of-river, not pumped
+storage. Bioenergy is solid biomass, biogas and waste. Every technology,
+including coal and oil, is fixed at the country share of the EU total.
+Nuclear uses the capacity still licensed in that year, so its country mix
+changes as units close.
 """
 
 from __future__ import annotations
@@ -144,6 +146,11 @@ def build_limits(plants: pd.DataFrame) -> pd.DataFrame:
     gas = plants["Fueltype"].eq("Natural Gas")
     coal = plants["Fueltype"].isin(["Hard Coal", "Lignite"])
     oil = plants["Fueltype"].eq("Oil")
+    hydro = plants["Fueltype"].eq("Hydro") & plants["Technology"].isin(
+        ["Reservoir", "Run-Of-River"]
+    )
+    biomass = plants["Fueltype"].isin(["Solid Biomass", "Biogas", "Waste"])
+    geothermal = plants["Fueltype"].eq("Geothermal")
 
     wind_on_share = _shares(plants, onshore)
     wind_off_share = _shares(plants, offshore)
@@ -159,6 +166,11 @@ def build_limits(plants: pd.DataFrame) -> pd.DataFrame:
         "coal-all": _extend(112.0, 66.0),
         "oil": _extend(20.0, 13.0),
     }
+    optional = {
+        "hydro": (hydro, _extend(163.0, 168.0)),
+        "biomass": (biomass, _extend(56.0, 59.0)),
+        "geothermal": (geothermal, _extend(1.0, 2.0)),
+    }
     country_share = {
         "onwind": wind_on_share,
         "offwind-all": wind_off_share,
@@ -167,10 +179,12 @@ def build_limits(plants: pd.DataFrame) -> pd.DataFrame:
         "coal-all": _shares(plants, coal),
         "oil": _shares(plants, oil),
     }
-    # A floor and a cap. Coal and oil only have a cap: existing plants cannot
-    # be retired early, so a floor below the surviving fleet would be infeasible.
-    # Nuclear is fixed on the CPS total: the floor and the cap are the same.
-    floor = {"onwind", "offwind-all", "solar-all", "gas", "nuclear"}
+    for carrier, (mask, years) in optional.items():
+        if mask.any() and float(plants.loc[mask, "Capacity"].sum()) > 0:
+            paths[carrier] = years
+            country_share[carrier] = _shares(plants, mask)
+    # Fixed at the CPS total, so the optimum cannot sit below the IEA capacity.
+    floor = set(paths) | {"nuclear"}
     nuclear_rows = _nuclear_rows(plants)
 
     rows = []

@@ -575,6 +575,10 @@ def prepare_network(
         n.stores.e_cyclic = False
         n.stores.e_initial = 0
 
+    from scripts.iea_cps_constraints import prepare_iea_cps
+
+    prepare_iea_cps(n, config, planning_horizons)
+
 
 def _ccl_horizon_block(table: pd.DataFrame, horizon: str | int) -> pd.DataFrame:
     """Return the min/max block for one planning year."""
@@ -621,12 +625,17 @@ def _ccl_rename(table: pd.DataFrame, options: dict) -> dict[str, str]:
                 "solar": "solar-all",
                 "solar-hsat": "solar-all",
                 "solar rooftop": "solar-all",
+                "csp": "solar-all",
             }
         )
     if "gas" in carriers:
         rename.update({"OCGT": "gas", "CCGT": "gas"})
     if "coal-all" in carriers:
         rename.update({"coal": "coal-all", "lignite": "coal-all"})
+    if "hydro" in carriers:
+        rename["ror"] = "hydro"
+    if "biomass" in carriers:
+        rename.update({"waste": "biomass", "biogas": "biomass"})
     return rename
 
 
@@ -715,6 +724,9 @@ def add_CCL_constraints(
     options = config["solving"]["agg_p_nom_limits"]
     table = pd.read_csv(options["file"], index_col=[0, 1], header=[0, 1])
     limits = _ccl_horizon_block(table, planning_horizons)
+    override = getattr(n, "_iea_capacity_override", None) or {}
+    for key, value in override.items():
+        limits.loc[key, ["min", "max"]] = value
     rename = _ccl_rename(limits, options)
     logger.info("Adding generation capacity constraints per carrier and country")
     year = int(planning_horizons)
@@ -951,9 +963,11 @@ def add_national_co2_constraints(
         logger.warning("No country CO2 flows were found to constrain.")
         return
 
+    equal = str(settings.get("sense", "leq")).lower() in {"equal", "eq", "=="}
     if eu_countries is not None:
+        rhs = float(caps.sum())
         n.model.add_constraints(
-            lhs <= float(caps.sum()),
+            lhs == rhs if equal else lhs <= rhs,
             name="co2_limit_eu",
         )
         return
@@ -967,8 +981,10 @@ def add_national_co2_constraints(
             ", ".join(skipped),
         )
     for ct in constrained:
+        rhs = float(caps[ct])
+        term = lhs.sel({dim: ct})
         n.model.add_constraints(
-            lhs.sel({dim: ct}) <= float(caps[ct]),
+            term == rhs if equal else term <= rhs,
             name=f"co2_limit_country_{ct}",
         )
 
@@ -1528,6 +1544,121 @@ def add_co2_atmosphere_constraint(
             )
 
 
+def _iea_extend(value_2030: float, value_2040: float) -> dict[int, float]:
+    """Fill 2035, 2045 and 2050 from the published 2030 and 2040 values."""
+    ratio = value_2040 / value_2030
+    step = ratio**0.5
+    return {
+        2030: value_2030,
+        2035: value_2030 * step,
+        2040: value_2040,
+        2045: value_2040 * step,
+        2050: value_2040 * ratio,
+    }
+
+
+def _warn_geothermal_capacity_factor(
+    n: pypsa.Network, twh: float, nyears: float
+) -> None:
+    """Warn when the geothermal terawatt-hours exceed the installed gigawatts."""
+    if n.generators.empty or "carrier" not in n.generators.columns:
+        return
+    idx = n.generators.index[n.generators.carrier.eq("geothermal")]
+    if idx.empty:
+        return
+    cap_mw = n.generators.loc[idx, "p_nom"]
+    if "p_nom_max" in n.generators.columns:
+        finite = n.generators.loc[idx, "p_nom_max"].replace([float("inf")], pd.NA)
+        cap_mw = cap_mw.where(finite.isna(), finite)
+    cap_mw = float(cap_mw.sum())
+    cap_twh = cap_mw * 8760.0 * nyears / 1e6
+    if twh > cap_twh + 1e-6:
+        logger.warning(
+            "Geothermal generation of %.1f TWh exceeds %.3f GW running all year "
+            "(%.2f TWh). Table A.3 gives 1 GW and 9 TWh in 2030.",
+            twh,
+            cap_mw / 1000.0,
+            cap_twh,
+        )
+
+
+def add_iea_generation_constraints(
+    n: pypsa.Network, planning_horizons: str | None
+) -> None:
+    """
+    Fix annual electricity output at the WEO 2019 Current Policies totals.
+
+    Values are EU electrical TWh. 2035, 2045 and 2050 keep the 2030-2040
+    ratio. Link output is ``p`` times electrical efficiency.
+    """
+    spec = n.config.get("iea_generation") or {}
+    if not spec.get("enable") or planning_horizons is None:
+        return
+    groups = {
+        "coal": ("Link", {"coal", "lignite"}),
+        "oil": ("Link", {"oil"}),
+        "gas": ("Link", {"OCGT", "CCGT", "gas"}),
+        "nuclear": ("Generator", {"nuclear"}),
+        "hydro": ("Generator", {"hydro", "ror"}),
+        "wind": (
+            "Generator",
+            {"onwind", "offwind", "offwind-ac", "offwind-dc", "offwind-float"},
+        ),
+        "solar": ("Generator", {"solar", "solar-hsat", "solar rooftop", "csp"}),
+        "geothermal": ("Generator", {"geothermal"}),
+        "biomass": (
+            "both",
+            {
+                "biomass",
+                "biogas",
+                "waste",
+                "urban central solid biomass CHP",
+                "urban central solid biomass CHP CC",
+            },
+        ),
+    }
+    year = int(planning_horizons)
+    weightings = n.snapshot_weightings.generators
+    nyears = float(weightings.sum()) / 8760.0
+    electricity = {"AC", "low voltage"}
+
+    for name, (kind, carriers) in groups.items():
+        pair = spec.get(name)
+        if not pair:
+            continue
+        published = {}
+        for key in (2030, 2040):
+            published[key] = pair[key] if key in pair else pair[str(key)]
+        twh = _iea_extend(float(published[2030]), float(published[2040]))[year]
+        target = twh * 1e6 * nyears
+        terms = []
+        if kind in {"Generator", "both"} and "Generator-p" in n.model.variables:
+            idx = n.generators.index[n.generators.carrier.isin(carriers)]
+            if len(idx):
+                terms.append((n.model["Generator-p"].loc[:, idx] * weightings).sum())
+        if kind in {"Link", "both"} and "Link-p" in n.model.variables:
+            chosen = n.links.carrier.isin(carriers)
+            if chosen.any():
+                bus_carrier = n.links.loc[chosen, "bus1"].map(n.buses.carrier)
+                idx = bus_carrier.index[bus_carrier.isin(electricity).to_numpy()]
+                if len(idx):
+                    efficiency = n.links.efficiency.reindex(idx).fillna(0)
+                    flow = n.model["Link-p"].loc[:, idx] * efficiency
+                    terms.append((flow * weightings).sum())
+        if not terms:
+            logger.warning(
+                "No %s plant is available for the %.0f TWh Current Policies target.",
+                name,
+                twh,
+            )
+            continue
+        energy = terms[0] if len(terms) == 1 else terms[0] + terms[1]
+        n.model.add_constraints(energy == target, name=f"iea_generation_{name}")
+        logger.info("Electricity from %s is fixed at %.1f TWh.", name, twh)
+        if name == "geothermal":
+            _warn_geothermal_capacity_factor(n, twh, nyears)
+
+
 def extra_functionality(
     n: pypsa.Network,
     snapshots: pd.DatetimeIndex,
@@ -1604,9 +1735,19 @@ def extra_functionality(
     if config["sector"]["imports"]["enable"]:
         add_import_limit_constraint(n, snapshots)
 
+    from scripts.iea_cps_constraints import (
+        add_iea_combustion_co2_constraints,
+        add_iea_final_fuel_constraints,
+    )
+
+    iea_co2 = config.get("iea_co2") or {}
     national_co2 = config.get("co2_budget_national") or {}
-    if national_co2.get("enable"):
+    if iea_co2.get("enable"):
+        add_iea_combustion_co2_constraints(n, planning_horizons)
+    elif national_co2.get("enable"):
         add_national_co2_constraints(n, planning_horizons, snakemake)
+    add_iea_generation_constraints(n, planning_horizons)
+    add_iea_final_fuel_constraints(n, planning_horizons)
 
     if n.params.custom_extra_functionality:
         source_path = n.params.custom_extra_functionality
@@ -1909,6 +2050,9 @@ if __name__ == "__main__":
                 f"Solving status '{status}' with termination condition '{condition}'"
             )
         check_objective_value(n, snakemake.params.solving, snakemake.wildcards.horizon)
+        from scripts.iea_cps_constraints import log_iea_primary_fuel_check
+
+        log_iea_primary_fuel_check(n, planning_horizons)
 
     if condition in [
         TerminationCondition.infeasible,
