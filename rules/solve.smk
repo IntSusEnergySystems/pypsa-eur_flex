@@ -7,6 +7,11 @@ rule solve_network:
     """Optimises investment and dispatch for one planning horizon to minimise total system cost."""
     input:
         network=resources("networks/composed_{horizon}.nc"),
+        co2_totals_reference=(
+            resources("co2_totals_reference.csv")
+            if config.get("co2_budget_national", {}).get("enable")
+            else []
+        ),
     output:
         network=RESULTS + "networks/solved_{horizon}.nc",
         model=(

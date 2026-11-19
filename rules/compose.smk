@@ -40,6 +40,7 @@ def get_compose_inputs(w):
                 and elec["estimate_renewable_capacities"]["from_powerplantmatching"]
             )
             or (foresight != "overnight" and horizon == horizons[0])
+            or elec.get("nuclear_fleet", False)
             else []
         ),
         hydro_capacities=ancient("data/hydro_capacities.csv"),
@@ -226,6 +227,7 @@ def get_compose_inputs(w):
     inputs["code_dependencies"] = [
         "scripts/add_electricity.py",
         "scripts/add_existing_baseyear.py",
+        "scripts/nuclear_fleet.py",
         "scripts/add_brownfield.py",
         "scripts/prepare_network.py",
         "scripts/prepare_perfect_foresight.py",

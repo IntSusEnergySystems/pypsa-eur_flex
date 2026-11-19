@@ -38,6 +38,8 @@ from scripts.add_electricity import (
     sanitize_locations,
 )
 from scripts.add_existing_baseyear import main as add_existing_capacities
+from scripts.build_iea_cps_capacity_limits import carrier_limit
+from scripts.nuclear_fleet import apply_nuclear_capacity
 from scripts.prepare_network import (
     apply_co2_budget_constraints,
     apply_temporal_aggregation,
@@ -118,6 +120,29 @@ if __name__ == "__main__":
     if foresight == "myopic" and not is_first_horizon:
         apply_brownfield(
             n, n_previous, inputs, params, current_horizon, renewable_carriers
+        )
+
+    if params.electricity.get("nuclear_fleet", False) and foresight == "myopic":
+        # One generator per country. EU countries that have a Current Policies
+        # share are fixed at that share. Other countries keep the fleet still
+        # online, plus new build from the previous myopic horizon.
+        powerplants = inputs.powerplants
+        if not isinstance(powerplants, str):
+            powerplants = list(powerplants)[0]
+        cps_max = None
+        agg_file = (
+            snakemake.config.get("solving", {}).get("agg_p_nom_limits", {}).get("file")
+        )
+        if agg_file:
+            cps_max = carrier_limit(agg_file, "nuclear", current_horizon)
+            if cps_max.empty:
+                cps_max = None
+        apply_nuclear_capacity(
+            n,
+            powerplants,
+            current_horizon,
+            n_previous=None if is_first_horizon else n_previous,
+            cps_max=cps_max,
         )
 
     if foresight == "perfect":

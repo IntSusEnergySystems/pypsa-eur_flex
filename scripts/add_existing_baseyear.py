@@ -166,6 +166,7 @@ def add_power_capacities_installed_before_baseyear(
     renewable_carriers: list[str],
     spatial: SimpleNamespace,
     solar_rooftop_ratio: float = 0.5,
+    keep_nuclear_as_generators: bool = False,
 ) -> None:
     """
     Add power generation capacities installed before base year.
@@ -194,6 +195,8 @@ def add_power_capacities_installed_before_baseyear(
         Container of spatial data
     solar_rooftop_ratio: float
         Ratio of solar capacity to assign to rooftop vs utility-scale (between 0 and 1)
+    keep_nuclear_as_generators: bool
+        Leave nuclear plants out of this routine so they stay generators.
     """
     logger.debug(f"Adding power capacities installed before {baseyear}")
 
@@ -231,6 +234,19 @@ def add_power_capacities_installed_before_baseyear(
     # drop unused fueltypes and technologies
     df_agg.drop(df_agg.index[df_agg.Fueltype.isin(fueltype_to_drop)], inplace=True)
     df_agg.drop(df_agg.index[df_agg.Technology.isin(technology_to_drop)], inplace=True)
+
+    # Nuclear stays a generator when nuclear_fleet is set. Adding it
+    # here as well would create a second fleet of uranium links.
+    if keep_nuclear_as_generators:
+        is_nuclear = df_agg.Fueltype.str.lower().eq("nuclear")
+        if is_nuclear.any():
+            logger.info(
+                "Not adding %d nuclear plants as links; existing nuclear "
+                "capacity is set from powerplants.csv.",
+                int(is_nuclear.sum()),
+            )
+            df_agg = df_agg.loc[~is_nuclear].copy()
+
     df_agg.Fueltype = df_agg.Fueltype.map(rename_fuel)
 
     # Fill missing DateIn
@@ -835,6 +851,9 @@ def main(
         renewable_carriers=renewable_carriers,
         spatial=spatial,
         solar_rooftop_ratio=params.existing_capacities["solar_rooftop_ratio"],
+        keep_nuclear_as_generators=params.electricity.get(
+            "nuclear_fleet", False
+        ),
     )
 
     if options["heating"]:

@@ -25,6 +25,30 @@ def co2_limit_name(bound: str, horizon: int | None = None) -> str:
     return name if horizon is None else f"{name}-{horizon}"
 
 
+def national_co2_fraction(
+    iea_mt: Mapping, year: int, reference_year: int
+) -> float:
+    """
+    Decline factor from an IEA emissions path.
+
+    ``iea_mt`` maps a year to energy-related CO2 in Mt. The factor is the
+    target year divided by the reference year, so a country's own inventory
+    in the reference year can be scaled without copying the IEA total.
+    """
+    table = {int(key): float(value) for key, value in iea_mt.items()}
+    try:
+        reference = table[int(reference_year)]
+        target = table[int(year)]
+    except KeyError as exc:
+        raise KeyError(
+            f"IEA CO2 table has no value for {exc.args[0]}. "
+            f"Available years: {sorted(table)}."
+        ) from exc
+    if reference <= 0:
+        raise ValueError("The IEA reference CO2 value must be positive.")
+    return target / reference
+
+
 def bound_value_for_horizon(bound: Any, current_horizon: int) -> float | None:
     if bound is None:
         return None

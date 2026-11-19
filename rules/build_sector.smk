@@ -772,6 +772,11 @@ rule build_co2_totals:
         eurostat=resources("eurostat_energy_balances.csv"),
     output:
         co2_totals=resources("co2_totals.csv"),
+        co2_reference=(
+            resources("co2_totals_reference.csv")
+            if config.get("co2_budget_national", {}).get("enable")
+            else []
+        ),
     log:
         logs("build_co2_totals.log"),
     benchmark:

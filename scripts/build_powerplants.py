@@ -39,6 +39,11 @@ import pypsa
 from shapely.geometry import MultiPolygon, Polygon
 
 from scripts._helpers import configure_logging, set_scenario_config
+from scripts.nuclear_fleet import (
+    apply_published_nuclear_dates,
+    fill_missing_nuclear_dateout,
+    nuclear_online_capacity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -260,4 +265,27 @@ if __name__ == "__main__":
         )
         ppl = ppl[~bus_null_b]
 
-    ppl.reset_index(drop=True).to_csv(snakemake.output[0])
+    ppl = ppl.reset_index(drop=True)
+    if snakemake.config["electricity"].get("nuclear_fleet", False):
+        # Recorded DateOut is kept. The published table then overwrites known
+        # units, and anything still missing becomes retrofit + 20 or
+        # commissioning + 40 (Belgian units with no date use 2035).
+        previous = fill_missing_nuclear_dateout(ppl)
+        ppl = apply_published_nuclear_dates(ppl)
+        ppl = fill_missing_nuclear_dateout(ppl)
+        horizons = (2030, 2040, 2050)
+        old = pd.concat(
+            {year: nuclear_online_capacity(previous, year) for year in horizons},
+            axis=1,
+        ).fillna(0)
+        new = pd.concat(
+            {year: nuclear_online_capacity(ppl, year) for year in horizons},
+            axis=1,
+        ).fillna(0)
+        diff = (new - old.reindex(new.index).fillna(0)).fillna(0)
+        logger.info(
+            "Nuclear capacity still online (GW), published dates minus the "
+            "40-year rule:\n%s",
+            (diff / 1e3).round(2).to_string(),
+        )
+    ppl.to_csv(snakemake.output[0])

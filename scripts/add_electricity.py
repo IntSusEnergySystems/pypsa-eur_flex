@@ -1267,10 +1267,13 @@ def main(
     extendable_carriers = params.electricity["extendable_carriers"]
     conventional_carriers = params.electricity["conventional_carriers"]
     if params.sector["enabled"]:
-        # with myopic or perfect foresight, add_existing_baseyear adds nuclear as links
-        sector_carriers = SECTOR_CARRIERS | (
-            {"nuclear"} if foresight != "overnight" else set()
-        )
+        # Myopic and perfect foresight normally move nuclear onto links in
+        # add_existing_baseyear. nuclear_fleet keeps one generator per
+        # country instead; see scripts/nuclear_fleet.py.
+        keep_nuclear = params.electricity.get("nuclear_fleet", False)
+        sector_carriers = set(SECTOR_CARRIERS)
+        if foresight != "overnight" and not keep_nuclear:
+            sector_carriers.add("nuclear")
         conventional_carriers = sorted(set(conventional_carriers) - sector_carriers)
         extendable_carriers = {
             c: sorted(set(carriers) - sector_carriers)

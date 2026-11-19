@@ -41,6 +41,7 @@ from scripts._helpers import (
     get,
     set_scenario_config,
 )
+from scripts.co2_budget import national_co2_fraction
 
 logger = logging.getLogger(__name__)
 
@@ -575,15 +576,127 @@ def prepare_network(
         n.stores.e_initial = 0
 
 
+def _ccl_horizon_block(table: pd.DataFrame, horizon: str | int) -> pd.DataFrame:
+    """Return the min/max block for one planning year."""
+    years = table.columns.get_level_values(0)
+    present = set(years)
+    key: str | int | None = None
+    for candidate in (horizon, str(horizon)):
+        if candidate in present:
+            key = candidate
+            break
+    if key is None:
+        try:
+            as_int = int(horizon)
+        except (TypeError, ValueError):
+            as_int = None
+        if as_int in present:
+            key = as_int
+    if key is None:
+        raise KeyError(
+            f"No capacity limits for {horizon}. Years in the file: "
+            f"{sorted({str(year) for year in present})}."
+        )
+    block = table[key].copy()
+    block.index = block.index.set_names(["country", "carrier"])
+    return block
+
+
+def _ccl_rename(table: pd.DataFrame, options: dict) -> dict[str, str]:
+    """Map component carriers onto the aggregate names used in the limit file."""
+    carriers = set(table.index.get_level_values("carrier"))
+    rename: dict[str, str] = {}
+    if options["agg_offwind"] or "offwind-all" in carriers:
+        rename.update(
+            {
+                "offwind-ac": "offwind-all",
+                "offwind-dc": "offwind-all",
+                "offwind-float": "offwind-all",
+                "offwind": "offwind-all",
+            }
+        )
+    if options["agg_solar"] or "solar-all" in carriers:
+        rename.update(
+            {
+                "solar": "solar-all",
+                "solar-hsat": "solar-all",
+                "solar rooftop": "solar-all",
+            }
+        )
+    if "gas" in carriers:
+        rename.update({"OCGT": "gas", "CCGT": "gas"})
+    if "coal-all" in carriers:
+        rename.update({"coal": "coal-all", "lignite": "coal-all"})
+    return rename
+
+
+def _ccl_existing_mw(
+    n: pypsa.Network,
+    component: str,
+    rename: dict[str, str],
+    year: int,
+) -> pd.Series:
+    """Electrical MW of non-extendable assets still online in ``year``."""
+    static = n.generators if component == "Generator" else n.links
+    fixed = static.loc[~static.p_nom_extendable].copy()
+    if fixed.empty:
+        return pd.Series(dtype=float, name="p_nom")
+    if {"build_year", "lifetime"} <= set(fixed.columns):
+        fixed = fixed.loc[(fixed["build_year"] + fixed["lifetime"]) >= year]
+    if fixed.empty:
+        return pd.Series(dtype=float, name="p_nom")
+    bus = fixed.bus if component == "Generator" else fixed.bus1
+    fixed["country"] = bus.map(n.buses.country)
+    fixed["carrier"] = fixed.carrier.replace(rename)
+    if component == "Link":
+        fixed["p_nom"] = fixed.p_nom.fillna(0) * fixed.efficiency.fillna(1.0)
+    grouped = (
+        fixed.dropna(subset=["country"])
+        .groupby(["country", "carrier"])["p_nom"]
+        .sum()
+    )
+    return grouped.rename("p_nom")
+
+
+def _ccl_extendable_expression(
+    n: pypsa.Network,
+    component: str,
+    rename: dict[str, str],
+):
+    """Extendable capacity, in electrical MW, grouped by country and carrier."""
+    variable = f"{component}-p_nom"
+    if variable not in n.model.variables:
+        return None
+    static = n.generators if component == "Generator" else n.links
+    extendable = static.query("p_nom_extendable").copy()
+    if extendable.empty:
+        return None
+    if not PYPSA_V1:
+        extendable = extendable.rename_axis(index=f"{component}-ext")
+    extendable["carrier"] = extendable.carrier.replace(rename)
+    bus = extendable.bus if component == "Generator" else extendable.bus1
+    p_nom = n.model[variable]
+    if component == "Link":
+        p_nom = p_nom.loc[extendable.index] * extendable.efficiency.fillna(1.0)
+    # The series name has to be ``bus`` so the grouped axis matches the
+    # generator constraint and can be renamed to country.
+    country = bus.map(n.buses.country)
+    country.name = "bus"
+    grouper = pd.concat([country, extendable.carrier], axis=1)
+    return p_nom.groupby(grouper).sum().rename(bus="country")
+
+
 def add_CCL_constraints(
     n: pypsa.Network, config: dict, planning_horizons: str | None
 ) -> None:
     """
-    Add CCL (country & carrier limit) constraint to the network.
+    Add country and carrier capacity limits.
 
-    Add minimum and maximum levels of generator nominal capacity per carrier
-    for individual countries. Opts and path for agg_p_nom_minmax.csv must be defined
-    in config.yaml. Default file is available at data/agg_p_nom_minmax.csv.
+    Values in ``agg_p_nom_minmax.csv`` are electrical MW. Generator capacity is
+    used as stored. Link capacity is the fuel-side ``p_nom`` times ``efficiency``,
+    which is how coal, lignite, oil, OCGT and CCGT are represented once sector
+    coupling is on. ``gas`` sums OCGT and CCGT. ``coal-all`` sums coal and lignite.
+    Wind and solar aggregates follow ``agg_offwind`` and ``agg_solar``.
 
     Parameters
     ----------
@@ -593,97 +706,270 @@ def add_CCL_constraints(
         Configuration dictionary
     planning_horizons : str, optional
         The current planning horizon year or None in perfect foresight
-
-    Example
-    -------
-    scenario:
-        opts: [Co2L-CCL-24h]
-    electricity:
-        agg_p_nom_limits: data/agg_p_nom_minmax.csv
     """
 
     assert planning_horizons is not None, (
         "add_CCL_constraints are not implemented for perfect foresight, yet"
     )
 
-    agg_p_nom_minmax = pd.read_csv(
-        config["solving"]["agg_p_nom_limits"]["file"], index_col=[0, 1], header=[0, 1]
-    )[planning_horizons]
+    options = config["solving"]["agg_p_nom_limits"]
+    table = pd.read_csv(options["file"], index_col=[0, 1], header=[0, 1])
+    limits = _ccl_horizon_block(table, planning_horizons)
+    rename = _ccl_rename(limits, options)
     logger.info("Adding generation capacity constraints per carrier and country")
-    p_nom = n.model["Generator-p_nom"]
+    year = int(planning_horizons)
+    wrote = False
 
-    gens = n.generators.query("p_nom_extendable")
-
-    if not PYPSA_V1:
-        gens = gens.rename_axis(index="Generator-ext")
-
-    if config["solving"]["agg_p_nom_limits"]["agg_offwind"]:
-        rename_offwind = {
-            "offwind-ac": "offwind-all",
-            "offwind-dc": "offwind-all",
-            "offwind-float": "offwind-all",
-            "offwind": "offwind-all",
-        }
-        gens = gens.replace(rename_offwind)
-    if config["solving"]["agg_p_nom_limits"]["agg_solar"]:
-        rename_solar = {
-            "solar": "solar-all",
-            "solar-hsat": "solar-all",
-            "solar rooftop": "solar-all",
-        }
-        gens = gens.replace(rename_solar)
-    grouper = pd.concat([gens.bus.map(n.buses.country), gens.carrier], axis=1)
-    lhs = p_nom.groupby(grouper).sum().rename(bus="country")
-
-    if config["solving"]["agg_p_nom_limits"]["include_existing"]:
-        gens_cst = n.generators.query("~p_nom_extendable").rename_axis(
-            index="Generator-cst"
-        )
-        gens_cst = gens_cst[
-            (gens_cst["build_year"] + gens_cst["lifetime"]) >= int(planning_horizons)
+    for component in ("Generator", "Link"):
+        lhs = _ccl_extendable_expression(n, component, rename)
+        if lhs is None:
+            continue
+        carriers = set(lhs.indexes["group"].get_level_values("carrier"))
+        component_limits = limits.loc[
+            limits.index.get_level_values("carrier").isin(carriers)
         ]
-        if config["solving"]["agg_p_nom_limits"]["agg_offwind"]:
-            gens_cst = gens_cst.replace(rename_offwind)
-        if config["solving"]["agg_p_nom_limits"]["agg_solar"]:
-            gens_cst = gens_cst.replace(rename_solar)
-        rhs_cst = (
-            pd.concat(
-                [gens_cst.bus.map(n.buses.country), gens_cst[["carrier", "p_nom"]]],
-                axis=1,
+        if component_limits.empty:
+            continue
+        if options["include_existing"]:
+            existing = _ccl_existing_mw(n, component, rename, year)
+            if existing.empty:
+                existing = pd.DataFrame(
+                    columns=["p_nom"],
+                    index=pd.MultiIndex.from_tuples([], names=["country", "carrier"]),
+                )
+            else:
+                existing = existing.to_frame()
+                existing.index = existing.index.set_names(["country", "carrier"])
+
+            def _remaining(bound: str) -> xr.DataArray:
+                limit = component_limits[bound].dropna()
+                idx = limit.index.join(existing.index, how="left")
+                limit = limit.reindex(idx).fillna(0)
+                already = existing.reindex(idx).fillna(0)
+                if "p_nom" not in already.columns:
+                    already["p_nom"] = 0.0
+                remaining = (limit - already.p_nom).dropna()
+                clipped = remaining < 0
+                if clipped.any():
+                    logger.info(
+                        "%d %s limits are already met by existing capacity in "
+                        "%s; new build for those is held at zero.",
+                        int(clipped.sum()),
+                        component,
+                        year,
+                    )
+                remaining[clipped] = 0
+                return xr.DataArray(remaining).rename(dim_0="group")
+
+            minimum = _remaining("min")
+            maximum = _remaining("max")
+        else:
+            minimum = xr.DataArray(component_limits["min"].dropna()).rename(
+                dim_0="group"
             )
-            .groupby(["bus", "carrier"])
-            .sum()
+            maximum = xr.DataArray(component_limits["max"].dropna()).rename(
+                dim_0="group"
+            )
+
+        index = minimum.indexes["group"].intersection(lhs.indexes["group"])
+        if not index.empty:
+            n.model.add_constraints(
+                lhs.sel(group=index) >= minimum.loc[index],
+                name=f"agg_p_nom_min_{component}",
+            )
+            wrote = True
+        index = maximum.indexes["group"].intersection(lhs.indexes["group"])
+        if not index.empty:
+            n.model.add_constraints(
+                lhs.sel(group=index) <= maximum.loc[index],
+                name=f"agg_p_nom_max_{component}",
+            )
+            wrote = True
+
+    if not wrote:
+        logger.warning(
+            "Country capacity limits found no extendable generators or links."
         )
-        rhs_cst.index = rhs_cst.index.rename({"bus": "country"})
-        rhs_min = agg_p_nom_minmax["min"].dropna()
-        idx_min = rhs_min.index.join(rhs_cst.index, how="left")
-        rhs_min = rhs_min.reindex(idx_min).fillna(0)
-        rhs = (rhs_min - rhs_cst.reindex(idx_min).fillna(0).p_nom).dropna()
-        rhs[rhs < 0] = 0
-        minimum = xr.DataArray(rhs).rename(dim_0="group")
-    else:
-        minimum = xr.DataArray(agg_p_nom_minmax["min"].dropna()).rename(dim_0="group")
 
-    index = minimum.indexes["group"].intersection(lhs.indexes["group"])
-    if not index.empty:
-        n.model.add_constraints(
-            lhs.sel(group=index) >= minimum.loc[index], name="agg_p_nom_min"
+
+def _link_country(n: pypsa.Network) -> pd.Series:
+    """Country of a link, taken from the first bus that is not an EU bus."""
+    country = pd.Series(pd.NA, index=n.links.index, dtype=object)
+    bus_columns = sorted(
+        (column for column in n.links.columns if re.fullmatch(r"bus\d+", column)),
+        key=lambda column: int(column[3:]),
+    )
+    for column in bus_columns:
+        buses = n.links[column]
+        valid = buses.notna() & buses.isin(n.buses.index)
+        mapped = pd.Series(pd.NA, index=n.links.index, dtype=object)
+        if valid.any():
+            if "country" in n.buses.columns:
+                mapped.loc[valid] = n.buses.country.reindex(buses[valid]).to_numpy()
+            missing = valid & mapped.isna()
+            if missing.any() and "location" in n.buses.columns:
+                mapped.loc[missing] = (
+                    n.buses.location.reindex(buses[missing]).to_numpy()
+                )
+        atmosphere = buses.map(n.buses.carrier).eq("co2")
+        mapped = mapped.mask(atmosphere | mapped.isin(["", "EU"]))
+        mapped = mapped.mask(mapped.astype(str).str.startswith("EU"))
+        take = country.isna() & mapped.notna()
+        country.loc[take] = mapped.loc[take]
+    return country
+
+
+def add_national_co2_constraints(
+    n: pypsa.Network,
+    planning_horizons: str | None,
+    snakemake,
+) -> None:
+    """
+    Cap CO2 at a reference inventory times an IEA index.
+
+    The index is ``iea_mt[horizon] / iea_mt[reference_year]``. WEO publishes
+    one European Union total. With ``aggregate: eu`` that total becomes one
+    cap on the EU countries together. Otherwise each country is capped on its
+    own. Emissions are the net flow into the ``co2`` atmosphere bus. Land use
+    is not added.
+    """
+    if planning_horizons is None:
+        logger.warning("National CO2 caps are not applied under perfect foresight.")
+        return
+    settings = n.config.get("co2_budget_national") or {}
+    path = snakemake.input.get("co2_totals_reference") if snakemake is not None else None
+    if not path:
+        raise FileNotFoundError(
+            "co2_budget_national is enabled but solve_network did not receive "
+            "co2_totals_reference.csv."
         )
 
-    if config["solving"]["agg_p_nom_limits"]["include_existing"]:
-        rhs_max = agg_p_nom_minmax["max"].dropna()
-        idx_max = rhs_max.index.join(rhs_cst.index, how="left")
-        rhs_max = rhs_max.reindex(idx_max).fillna(0)
-        rhs = (rhs_max - rhs_cst.reindex(idx_max).fillna(0).p_nom).dropna()
-        rhs[rhs < 0] = 0
-        maximum = xr.DataArray(rhs).rename(dim_0="group")
-    else:
-        maximum = xr.DataArray(agg_p_nom_minmax["max"].dropna()).rename(dim_0="group")
+    from scripts.prepare_sector_network import determine_emission_sectors
 
-    index = maximum.indexes["group"].intersection(lhs.indexes["group"])
-    if not index.empty:
+    year = int(planning_horizons)
+    reference_year = int(settings["reference_year"])
+    fraction = national_co2_fraction(settings["iea_mt"], year, reference_year)
+    sectors = determine_emission_sectors(n.config["sector"])
+    totals = pd.read_csv(path, index_col=0)
+    inventory = totals.reindex(n.config["countries"])[sectors].sum(axis=1)
+    aggregate = str(settings.get("aggregate", "country")).lower()
+    eu_countries = None
+    if aggregate == "eu":
+        from scripts.build_iea_cps_capacity_limits import EU_IN_MODEL
+
+        listed = settings.get("countries")
+        eu_countries = {str(code) for code in (listed or EU_IN_MODEL)}
+        inventory = inventory.reindex(sorted(eu_countries))
+    missing = inventory.index[inventory.isna()]
+    if len(missing):
+        logger.warning(
+            "No %s CO2 inventory for %s; those countries are not in the cap.",
+            reference_year,
+            ", ".join(missing),
+        )
+    inventory = inventory.dropna()
+    nyears = float(n.snapshot_weightings.generators.sum()) / 8760.0
+    caps = inventory * 1e6 * fraction * nyears
+    if eu_countries is None:
+        logger.info(
+            "National CO2 caps are %.3f times %s emissions (%.0f Mt over %d countries).",
+            fraction,
+            reference_year,
+            float(inventory.sum() * fraction),
+            int(caps.size),
+        )
+    else:
+        logger.info(
+            "EU CO2 cap is %.3f times the %s emissions of %d EU countries (%.0f Mt). "
+            "Countries outside that group are not in the cap.",
+            fraction,
+            reference_year,
+            int(caps.size),
+            float(inventory.sum() * fraction),
+        )
+
+    if "Link-p" not in n.model.variables:
+        logger.warning("No link flows to constrain with national CO2 caps.")
+        return
+
+    country = _link_country(n)
+    p = n.model["Link-p"]
+    weightings = n.snapshot_weightings.generators
+    lhs = None
+    unassigned = []
+    ports = [
+        column[3:]
+        for column in n.links.columns
+        if re.fullmatch(r"bus\d+", column)
+    ]
+    for column in ports:
+        bus_column = f"bus{column}"
+        on_atmosphere = n.links[bus_column].map(n.buses.carrier).eq("co2")
+        if column == "0":
+            efficiency = pd.Series(-1.0, index=n.links.index)
+        elif column == "1":
+            efficiency = n.links["efficiency"]
+        elif f"efficiency{column}" in n.links.columns:
+            efficiency = n.links[f"efficiency{column}"]
+        else:
+            continue
+        idx = n.links.index[on_atmosphere]
+        if idx.empty:
+            continue
+        grouped_country = country.reindex(idx)
+        missing_country = grouped_country.isna()
+        if missing_country.any():
+            unassigned.extend(
+                n.links.loc[
+                    grouped_country.index[missing_country.to_numpy()], "carrier"
+                ].tolist()
+            )
+            grouped_country = grouped_country.dropna()
+        grouped_country = grouped_country.rename("country")
+        if eu_countries is not None:
+            grouped_country = grouped_country[grouped_country.isin(eu_countries)]
+        if grouped_country.empty:
+            continue
+        kept = grouped_country.index
+        weighted = (p.loc[:, kept] * efficiency.reindex(kept).fillna(0)) * weightings
+        if eu_countries is None:
+            term = weighted.groupby(grouped_country).sum().sum("snapshot")
+            lhs = term if lhs is None else lhs + term
+        else:
+            # One total for the EU. Summing the links directly avoids adding
+            # two country-grouped expressions together.
+            term = weighted.sum()
+            lhs = term if lhs is None else lhs + term
+
+    if unassigned:
+        counts = pd.Series(unassigned).value_counts()
+        logger.warning(
+            "CO2 flows with no country are outside the CO2 cap:\n%s",
+            counts.to_string(),
+        )
+    if lhs is None:
+        logger.warning("No country CO2 flows were found to constrain.")
+        return
+
+    if eu_countries is not None:
         n.model.add_constraints(
-            lhs.sel(group=index) <= maximum.loc[index], name="agg_p_nom_max"
+            lhs <= float(caps.sum()),
+            name="co2_limit_eu",
+        )
+        return
+
+    dim = next(iter(lhs.dims))
+    constrained = [ct for ct in caps.index if ct in lhs.indexes[dim]]
+    skipped = caps.index.difference(constrained)
+    if len(skipped):
+        logger.info(
+            "No emitting links for %s; those national caps are not written.",
+            ", ".join(skipped),
+        )
+    for ct in constrained:
+        n.model.add_constraints(
+            lhs.sel({dim: ct}) <= float(caps[ct]),
+            name=f"co2_limit_country_{ct}",
         )
 
 
@@ -1275,7 +1561,9 @@ def extra_functionality(
         add_BAU_constraints(n, config)
     if constraints["SAFE"] and n.generators.p_nom_extendable.any():
         add_SAFE_constraints(n, config)
-    if constraints["CCL"] and n.generators.p_nom_extendable.any():
+    if constraints["CCL"] and (
+        n.generators.p_nom_extendable.any() or n.links.p_nom_extendable.any()
+    ):
         add_CCL_constraints(n, config, planning_horizons)
 
     reserve = config["electricity"].get("operational_reserve", {})
@@ -1315,6 +1603,10 @@ def extra_functionality(
 
     if config["sector"]["imports"]["enable"]:
         add_import_limit_constraint(n, snapshots)
+
+    national_co2 = config.get("co2_budget_national") or {}
+    if national_co2.get("enable"):
+        add_national_co2_constraints(n, planning_horizons, snakemake)
 
     if n.params.custom_extra_functionality:
         source_path = n.params.custom_extra_functionality

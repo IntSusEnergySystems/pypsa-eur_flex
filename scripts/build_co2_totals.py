@@ -244,3 +244,19 @@ if __name__ == "__main__":
 
     co2 = build_co2_totals(countries, eea_co2, eurostat_co2)
     co2.to_csv(snakemake.output.co2_totals)
+
+    reference_out = snakemake.output.get("co2_reference")
+    national = snakemake.config.get("co2_budget_national") or {}
+    if reference_out and national.get("enable"):
+        reference_year = int(national["reference_year"])
+        eea_reference = build_eea_co2(
+            snakemake.input.co2, reference_year, emissions_scope
+        )
+        eurostat_reference = build_eurostat_co2(eurostat, reference_year)
+        reference = build_co2_totals(countries, eea_reference, eurostat_reference)
+        reference.to_csv(reference_out)
+        logger.info(
+            "Wrote %s CO2 totals for the national cap to %s",
+            reference_year,
+            reference_out,
+        )
