@@ -273,6 +273,41 @@ def test_iea_generation_fixes_annual_electricity():
     assert float(constraint.data.coeffs[0]) == pytest.approx(0.4)
 
 
+def test_biomass_electricity_skips_biogas_supply_generators():
+    """A generator on a biogas bus is fuel supply, not electrical biomass."""
+    pytest.importorskip("pandera")
+    from scripts.solve_network import add_iea_generation_constraints
+
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.add("Bus", ["DE", "biogas"], carrier=["AC", "biogas"])
+    n.add(
+        "Generator",
+        "DE biomass",
+        bus="DE",
+        carrier="biomass",
+        p_nom=10,
+        marginal_cost=1,
+    )
+    n.add(
+        "Generator",
+        "biogas supply",
+        bus="biogas",
+        carrier="biogas",
+        p_nom=1.0e6,
+        marginal_cost=1,
+    )
+    n.config = {
+        "iea_generation": {"enable": True, "biomass": {"2030": 278, "2040": 303}}
+    }
+    n.optimize.create_model()
+    add_iea_generation_constraints(n, "2030")
+    labels = n.model.variables["Generator-p"].labels.to_series()
+    used = set(n.model.constraints["iea_generation_biomass"].data.vars.values)
+    names = set(labels[labels.isin(used)].index.get_level_values("name"))
+    assert names == {"DE biomass"}
+
+
 def test_ccl_horizon_block_accepts_string_and_int_years():
     pytest.importorskip("pandera")
     from scripts.solve_network import _ccl_horizon_block
@@ -378,6 +413,194 @@ def test_derate_brings_existing_coal_down_to_the_share(tmp_path):
     )
     assert n.links.loc["DE coal", "p_nom"] == pytest.approx(250.0)
     assert n.links.loc["DE coal", "p_nom"] * 0.4 == pytest.approx(100.0)
+
+
+def test_derate_leaves_fuel_supply_generators_alone(tmp_path):
+    from scripts.iea_cps_constraints import derate_existing_to_cps
+
+    path = _limit_file(tmp_path / "limits.csv", [("FR", "biomass", 1000.0, 1000.0)])
+    n = pypsa.Network()
+    n.add("Bus", "FR biogas", carrier="biogas", country="FR")
+    n.add(
+        "Generator",
+        "FR biogas",
+        bus="FR biogas",
+        carrier="biogas",
+        p_nom=2.0e7,
+        p_nom_extendable=False,
+    )
+    derate_existing_to_cps(
+        n,
+        {
+            "solving": {
+                "agg_p_nom_limits": {
+                    "file": path.as_posix(),
+                    "agg_offwind": True,
+                    "agg_solar": True,
+                }
+            }
+        },
+        "2030",
+    )
+    assert n.generators.loc["FR biogas", "p_nom"] == pytest.approx(2.0e7)
+
+
+def test_wind_capacity_rises_when_the_weather_year_is_short(tmp_path):
+    from scripts.iea_cps_constraints import lift_weather_limited_generation
+
+    path = _limit_file(tmp_path / "limits.csv", [("DE", "onwind", 1000.0, 1000.0)])
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.snapshot_weightings.loc[:, :] = 1.0
+    n.add("Bus", "DE", carrier="AC", country="DE")
+    n.add(
+        "Generator",
+        "DE wind",
+        bus="DE",
+        carrier="onwind",
+        p_nom=1000,
+        p_nom_extendable=True,
+        p_nom_max=1000,
+        p_max_pu=0.5,
+        capital_cost=1,
+        marginal_cost=1,
+    )
+    # 1000 MW at 50% over 2 hours is 1000 MWh. Ask for 2000 MWh.
+    lift_weather_limited_generation(
+        n,
+        {
+            "iea_generation": {
+                "enable": True,
+                "wind": {2030: 8.76, 2040: 8.76},
+            },
+            "solving": {"agg_p_nom_limits": {"file": path.as_posix()}},
+        },
+        "2030",
+    )
+    assert n._iea_capacity_override[("DE", "onwind")][0] == pytest.approx(1000.0)
+    assert n._iea_capacity_override[("DE", "onwind")][1] == pytest.approx(2000.0, rel=1e-4)
+
+
+def test_reservoir_inflow_rises_to_the_hydro_total():
+    from scripts.iea_cps_constraints import lift_hydro_inflow_to_published_energy
+
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.snapshot_weightings.loc[:, :] = 1.0
+    n.add("Bus", "DE", carrier="AC", country="DE")
+    n.add("Generator", "DE ror", bus="DE", carrier="ror", p_nom=100, p_max_pu=0.5)
+    n.add("StorageUnit", "DE hydro", bus="DE", carrier="hydro", p_nom=1000, max_hours=10)
+    n.storage_units_t.inflow["DE hydro"] = 10.0
+    # Run-of-river supplies 100 MWh. Inflow supplies 20 MWh. Ask for 200 MWh.
+    lift_hydro_inflow_to_published_energy(
+        n,
+        {"iea_generation": {"enable": True, "hydro": {2030: 0.876, 2040: 0.876}}},
+        "2030",
+    )
+    assert float(n.storage_units_t.inflow["DE hydro"].sum()) == pytest.approx(100.0, rel=1e-4)
+
+
+def test_oil_co2_follows_the_fuel_the_plants_actually_burn():
+    from scripts.iea_cps_constraints import reconcile_co2_with_fuel_use
+
+    n = pypsa.Network()
+    n.add("Bus", ["EU oil", "DE", "DE transport", "co2 atmosphere"], carrier=["oil", "AC", "land transport oil", "co2"])
+    n.add(
+        "Link",
+        "DE oil power",
+        bus0="EU oil",
+        bus1="DE",
+        bus2="co2 atmosphere",
+        carrier="oil",
+        efficiency=0.35,
+        efficiency2=0.2571,
+        p_nom=100,
+    )
+    n.add(
+        "Link",
+        "DE transport",
+        bus0="EU oil",
+        bus1="DE transport",
+        bus2="co2 atmosphere",
+        carrier="land transport oil",
+        efficiency=1.0,
+        efficiency2=0.2571,
+        p_nom=100,
+    )
+    n.config = {
+        "iea_co2": {
+            "coal": {2030: 637, 2040: 424},
+            "oil": {2030: 1132, 2040: 975},
+            "gas": {2030: 893, 2040: 929},
+            "power_coal": {2030: 483, 2040: 292},
+            "power_oil": {2030: 19, 2040: 13},
+            "power_gas": {2030: 294, 2040: 327},
+            "final_coal": {2030: 123, 2040: 105},
+            "final_oil": {2030: 1047, 2040: 900},
+            "final_gas": {2030: 567, 2040: 571},
+            "transport_oil": {2030: 831, 2040: 736},
+        },
+        "iea_generation": {"oil": {2030: 21, 2040: 14}},
+        "iea_final": {
+            "transport": {"oil": {2030: 274, 2040: 242}, "biofuels": {2030: 25, 2040: 27}},
+            "buildings": {"oil": {2030: 0, 2040: 0}, "coal": {2030: 0, 2040: 0}, "gas": {2030: 0, 2040: 0}},
+            "industry": {"oil": {2030: 0, 2040: 0}, "coal": {2030: 0, 2040: 0}, "gas": {2030: 0, 2040: 0}},
+        },
+    }
+    targets = reconcile_co2_with_fuel_use(n, 2030)
+    assert targets["power_oil"] == pytest.approx(21 * 0.2571 / 0.35, rel=1e-3)
+    assert targets["transport_oil"] == pytest.approx(299 * (41.868e6 / 3.6) * 0.2571 / 1e6, rel=1e-3)
+
+
+def test_process_emissions_fill_the_industry_share_of_final_co2():
+    from scripts.iea_cps_constraints import (
+        MWH_PER_MTOE,
+        _industry_fuel_co2_mt,
+        _process_co2_mt,
+        industry_co2_target_mt,
+        scale_process_emissions_to_industry_co2,
+    )
+
+    config = {
+        "iea_co2": {
+            "enable": True,
+            "final_coal": {2030: 123, 2040: 105},
+            "final_oil": {2030: 1047, 2040: 900},
+            "final_gas": {2030: 567, 2040: 571},
+            "transport_oil": {2030: 831, 2040: 736},
+        },
+        "iea_final": {
+            "enable": True,
+            "industry": {
+                "coal": {2030: 20, 2040: 18},
+                "oil": {2030: 26, 2040: 24},
+                "gas": {2030: 87, 2040: 84},
+            },
+            "buildings": {
+                "coal": {2030: 6, 2040: 3},
+                "oil": {2030: 32, 2040: 18},
+                "gas": {2030: 154, 2040: 158},
+            },
+        },
+    }
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.snapshot_weightings.loc[:, :] = 4380.0
+    n.add("Bus", ["EU oil", "EU coal", "EU gas", "industry", "process", "co2 atmosphere"], carrier=["oil", "coal", "gas", "industry", "process emissions", "co2"])
+    n.add("Link", "coal", bus0="EU coal", bus1="industry", bus2="co2 atmosphere", carrier="coal for industry", efficiency=1.0, efficiency2=0.3361)
+    n.add("Link", "gas", bus0="EU gas", bus1="industry", bus2="co2 atmosphere", carrier="gas for industry", efficiency=1.0, efficiency2=0.198)
+    n.add("Link", "naphtha", bus0="EU oil", bus1="industry", bus2="process", bus3="co2 atmosphere", carrier="naphtha for industry", efficiency=1.0, efficiency2=0.02, efficiency3=0.2365)
+    hours = float(n.snapshot_weightings.generators.sum())
+    n.add("Load", "naphtha for industry", bus="industry", carrier="naphtha for industry", p_set=26 * MWH_PER_MTOE / hours)
+    n.add("Load", "process emissions", bus="process", carrier="process emissions", p_set=-80e6 / hours)
+    before = float(n.links.at["naphtha", "efficiency3"])
+    scale_process_emissions_to_industry_co2(n, config, "2030")
+    fuel = _industry_fuel_co2_mt(n, config, 2030)
+    process = _process_co2_mt(n)
+    assert fuel + process == pytest.approx(industry_co2_target_mt(config, 2030), abs=0.05)
+    assert process < 80
+    assert float(n.links.at["naphtha", "efficiency3"]) == before
+    assert float(n.links.at["naphtha", "efficiency2"]) < 0.02
 
 
 def test_csp_is_must_run_without_cost(tmp_path):
@@ -654,6 +877,32 @@ def test_coal_boilers_and_other_energy_sector_are_added():
     assert "DE residential rural coal boiler" in names("iea_co2_final_coal")
 
 
+def test_eu_comparison_matches_a_fixed_dispatch(tmp_path):
+    from scripts.iea_cps_constraints import MWH_PER_MTOE
+    from postprocessing.postprocess_iea_cps import compare_network, plot_category
+
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.snapshot_weightings.loc[:, :] = 4380.0
+    n.add("Bus", "DE", carrier="AC")
+    n.add("Generator", "DE nuclear", bus="DE", carrier="nuclear", p_nom=1000)
+    n.generators_t.p["DE nuclear"] = 1000.0
+    n.add("Load", "DE industry electricity", bus="DE", carrier="industry electricity", p_set=MWH_PER_MTOE / 8760)
+    config = {
+        "iea_generation": {"enable": True, "nuclear": {2030: 8.76, 2040: 8.76}},
+        "iea_final": {"enable": True, "industry": {"electricity": {2030: 1, 2040: 1}}},
+    }
+    report = compare_network(n, config, 2030)
+    nuclear = report.loc[report["name"].eq("nuclear")].iloc[0]
+    electricity = report.loc[report["name"].eq("industry electricity")].iloc[0]
+    assert nuclear.status == "pass"
+    assert nuclear.model == pytest.approx(8.76)
+    assert electricity.status == "pass"
+    assert electricity.model == pytest.approx(1.0)
+    plot_category(report, "electricity", tmp_path / "electricity.png")
+    assert (tmp_path / "electricity.png").stat().st_size > 0
+
+
 def test_naphtha_is_scaled_to_industry_oil():
     from scripts.iea_cps_constraints import (
         MWH_PER_MTOE,
@@ -715,17 +964,25 @@ def test_geothermal_capacity_is_raised_when_energy_exceeds_the_gigawatts(tmp_pat
     )
     n = pypsa.Network()
     n.add("Bus", ["DE", "FR"], carrier="AC", country=["DE", "FR"])
-    n.add("Generator", "DE geo", bus="DE", carrier="geothermal", p_nom=600, p_max_pu=0.5)
-    n.add("Generator", "FR geo", bus="FR", carrier="geothermal", p_nom=400, p_max_pu=0.5)
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.add("Generator", "DE geo", bus="DE", carrier="geothermal", p_nom=600, p_max_pu=0.5, p_min_pu=1)
+    n.add("Generator", "FR geo", bus="FR", carrier="geothermal", p_nom=400, p_max_pu=0.5, p_min_pu=1)
+    n.generators_t.p_min_pu["DE geo"] = 1.0
+    n.generators_t.p_max_pu["FR geo"] = 0.5
     config = {
         "iea_generation": {"enable": True, "geothermal": {2030: 9, 2040: 12}},
         "solving": {"agg_p_nom_limits": {"file": path.as_posix()}},
     }
     lift_geothermal_if_energy_exceeds_capacity(n, config, "2030")
     required = 9 / 8.76 * 1000
-    assert n.generators.p_nom_max.sum() == pytest.approx(required)
-    assert float(n.generators.p_min_pu.min()) == 1
-    assert sum(n._iea_capacity_override.values()) == pytest.approx(required)
+    assert n.generators.p_nom.sum() == pytest.approx(required, rel=1e-5)
+    assert n.generators.p_nom.sum() > required
+    assert n.generators.p_nom_max.sum() == pytest.approx(n.generators.p_nom.sum())
+    assert float(n.generators.p_max_pu.min()) == 1
+    assert float(n.generators.p_min_pu.max()) == 0
+    assert "DE geo" not in n.generators_t.p_min_pu.columns
+    assert "FR geo" not in n.generators_t.p_max_pu.columns
+    assert sum(n._iea_capacity_override.values()) == pytest.approx(required, rel=1e-5)
     # 2 GW can produce 12 TWh, so 2040 is not raised.
     n2040 = pypsa.Network()
     n2040.add("Bus", "DE", carrier="AC", country="DE")
@@ -739,6 +996,92 @@ def test_geothermal_capacity_is_raised_when_energy_exceeds_the_gigawatts(tmp_pat
     lift_geothermal_if_energy_exceeds_capacity(n2040, config, "2040")
     assert n2040.generators.at["DE geo", "p_nom"] == 2000
     assert not getattr(n2040, "_iea_capacity_override", None)
+    # The file allows 2 GW, but the plant is only 0.9 GW and cannot make 12 TWh.
+    short = pypsa.Network()
+    short.add("Bus", "DE", carrier="AC", country="DE")
+    short.add(
+        "Generator",
+        "DE geo",
+        bus="DE",
+        carrier="geothermal",
+        p_nom=900,
+        p_nom_max=900,
+    )
+    lift_geothermal_if_energy_exceeds_capacity(short, config, "2040")
+    required_2040 = 12 / 8.76 * 1000
+    assert short.generators.at["DE geo", "p_nom"] == pytest.approx(
+        required_2040, rel=1e-5
+    )
+    assert short.generators.at["DE geo", "p_nom"] > required_2040
+
+
+def test_agriculture_oil_outside_the_allocated_rows_is_removed():
+    from scripts.iea_cps_constraints import remove_agriculture_oil_outside_the_oil_rows
+
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.add("Bus", "oil", carrier="agriculture machinery oil")
+    n.add("Load", "DE agriculture oil", bus="oil", carrier="agriculture machinery oil", p_set=5.0)
+    remove_agriculture_oil_outside_the_oil_rows(n)
+    assert n.loads.at["DE agriculture oil", "p_set"] == 0.0
+
+
+def test_solid_biomass_ceiling_covers_electricity_fuel():
+    from scripts.iea_cps_constraints import raise_solid_biomass_ceiling
+
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.add("Bus", "biomass", carrier="solid biomass")
+    n.add("Bus", "AC", carrier="AC")
+    n.add(
+        "Generator",
+        "supply",
+        bus="biomass",
+        carrier="solid biomass",
+        p_nom=100,
+        e_sum_max=100,
+    )
+    n.add(
+        "GlobalConstraint",
+        "biomass limit",
+        type="operational_limit",
+        carrier_attribute="solid biomass",
+        sense="<=",
+        constant=100,
+    )
+    n.add(
+        "GlobalConstraint",
+        "unsustainable biomass limit",
+        type="operational_limit",
+        carrier_attribute="unsustainable solid biomass",
+        sense="==",
+        constant=50,
+    )
+    n.add(
+        "Link",
+        "chp",
+        bus0="biomass",
+        bus1="AC",
+        carrier="urban central solid biomass CHP",
+        efficiency=0.5,
+        p_nom=10,
+    )
+    raise_solid_biomass_ceiling(
+        n,
+        {
+            "iea_generation": {"enable": True, "biomass": {2030: 8.76, 2040: 8.76}},
+            "iea_final": {"enable": True},
+        },
+        "2030",
+    )
+    # 8.76 TWh over the toy year fraction, divided by efficiency 0.5, minus 50 MWh unsustainable.
+    nyears = 2 / 8760
+    required = 8.76e6 * nyears / 0.5
+    expected = required * (1 + 1e-4) - 50
+    assert n.global_constraints.at["biomass limit", "constant"] == pytest.approx(expected)
+    assert n.generators.at["supply", "e_sum_max"] == pytest.approx(expected)
+    assert n.generators.at["supply", "p_nom"] == pytest.approx(expected)
+    assert n.global_constraints.at["unsustainable biomass limit", "constant"] == 50
 
 
 def test_international_aviation_and_shipping_are_omitted():

@@ -2,6 +2,15 @@
 #
 # SPDX-License-Identifier: MIT
 
+def all_solved_networks(wildcards):
+    """Every solved horizon. Post-processing waits until the last year is finished."""
+    return expand(
+        RESULTS + "networks/solved_{horizon}.nc",
+        horizon=config["planning_horizons"],
+        run=config["run"]["name"],
+    )
+
+
 if config["foresight"] != "perfect":
 
     rule plot_base_network:
@@ -42,6 +51,7 @@ if config["foresight"] != "perfect":
         """Plots the optimised power network with regional technology costs and grid expansion."""
         input:
             network=RESULTS + "networks/solved_{horizon}.nc",
+            all_solved=all_solved_networks,
             regions=resources("onshore_regions.geojson"),
         output:
             map=RESULTS + "maps/static/power_network_{horizon}.pdf",
@@ -62,6 +72,7 @@ if config["foresight"] != "perfect":
         """Plots the optimised hydrogen pipelines, storage, electrolysis and fuel cells on a map."""
         input:
             network=RESULTS + "networks/solved_{horizon}.nc",
+            all_solved=all_solved_networks,
             regions=resources("onshore_regions.geojson"),
         output:
             map=RESULTS + "maps/static/h2_network_{horizon}.pdf",
@@ -82,6 +93,7 @@ if config["foresight"] != "perfect":
         """Plots the optimised methane pipeline network and regional gas sources on a map."""
         input:
             network=RESULTS + "networks/solved_{horizon}.nc",
+            all_solved=all_solved_networks,
             regions=resources("onshore_regions.geojson"),
         output:
             map=RESULTS + "maps/static/ch4_network_{horizon}.pdf",
@@ -101,6 +113,7 @@ if config["foresight"] != "perfect":
         """Plots a static map of the nodal energy balance, flows and prices for one bus carrier."""
         input:
             network=RESULTS + "networks/solved_{horizon}.nc",
+            all_solved=all_solved_networks,
             regions=resources("onshore_regions.geojson"),
         output:
             RESULTS + "maps/static/balance_map_{carrier}_{horizon}.pdf",
@@ -121,6 +134,7 @@ if config["foresight"] != "perfect":
         """Plots an interactive map of the nodal energy balance, flows and prices for one bus carrier."""
         input:
             network=RESULTS + "networks/solved_{horizon}.nc",
+            all_solved=all_solved_networks,
             regions=resources("onshore_regions.geojson"),
         output:
             RESULTS + "maps/interactive/balance_map_{carrier}_{horizon}.html",
@@ -252,6 +266,7 @@ rule plot_balance_timeseries:
     """Plots stacked energy balance time series per carrier at annual and monthly resolution."""
     input:
         network=RESULTS + "networks/solved_{horizon}.nc",
+        all_solved=all_solved_networks,
         rc="matplotlibrc",
     output:
         directory(RESULTS + "graphs/balance_timeseries_{horizon}"),
@@ -274,6 +289,7 @@ rule plot_heatmap_timeseries:
     """Plots hour-by-day heatmaps of utilisation rates, marginal prices and storage levels."""
     input:
         network=RESULTS + "networks/solved_{horizon}.nc",
+        all_solved=all_solved_networks,
         rc="matplotlibrc",
     output:
         directory(RESULTS + "graphs/heatmap_timeseries_{horizon}"),
@@ -309,6 +325,7 @@ rule plot_base_statistics:
     """Plots bar charts of capacities, costs, curtailment, supply and market values per carrier."""
     input:
         network=RESULTS + "networks/solved_{horizon}.nc",
+        all_solved=all_solved_networks,
     output:
         **{
             f"{plot}_bar": RESULTS + f"figures/statistics_{plot}_bar_{{horizon}}.pdf"
@@ -359,6 +376,7 @@ rule plot_interactive_bus_balance:
     """Plots interactive energy balance time series for each bus matching a name pattern."""
     input:
         network=RESULTS + "networks/solved_{horizon}.nc",
+        all_solved=all_solved_networks,
         rc="matplotlibrc",
     output:
         directory=directory(RESULTS + "graphics/interactive_bus_balance/{horizon}"),
@@ -377,3 +395,43 @@ rule plot_interactive_bus_balance:
         ),
     script:
         scripts("plot_interactive_bus_balance.py")
+
+
+rule iea_comparison:
+    """Compares solved EU electricity, capacity, CO2, final energy and costs with Current Policies."""
+    input:
+        networks=all_solved_networks,
+    output:
+        csv=RESULTS + "iea_comparison/eu_comparison.csv",
+        text=RESULTS + "iea_comparison/eu_comparison.txt",
+        electricity=RESULTS + "iea_comparison/electricity.png",
+        capacity=RESULTS + "iea_comparison/capacity.png",
+        co2=RESULTS + "iea_comparison/co2.png",
+        final_energy=RESULTS + "iea_comparison/final_energy.png",
+        primary=RESULTS + "iea_comparison/primary.png",
+        costs=RESULTS + "iea_comparison/costs.png",
+    log:
+        RESULTS + "logs/iea_comparison.log",
+    threads: 2
+    resources:
+        mem_mb=20000,
+    script:
+        workflow.source_path("../postprocessing/postprocess_iea_cps.py")
+
+
+rule iea_abatement:
+    """Plots the EU CO2 price, emissions and system-cost curve from the solved years."""
+    input:
+        networks=all_solved_networks,
+        comparison=RESULTS + "iea_comparison/eu_comparison.csv",
+    output:
+        summary=RESULTS + "iea_comparison/abatement_summary.csv",
+        costs=RESULTS + "iea_comparison/abatement_costs.csv",
+        curve=RESULTS + "iea_comparison/abatement_curve.png",
+    log:
+        RESULTS + "logs/iea_abatement.log",
+    threads: 2
+    resources:
+        mem_mb=20000,
+    script:
+        workflow.source_path("../postprocessing/abatement_curve.py")

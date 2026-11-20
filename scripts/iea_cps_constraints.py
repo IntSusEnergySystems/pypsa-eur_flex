@@ -19,6 +19,9 @@ import pypsa
 
 logger = logging.getLogger(__name__)
 
+# Capacity shares are electrical megawatts. Fuel buses are not.
+_ELECTRICITY_CARRIERS = {"AC", "low voltage"}
+
 # 1 toe = 41.868 GJ. 1 Mtoe = 11.63 million MWh.
 MWH_PER_MTOE = 41.868e6 / 3.6
 # 7.33 barrels per tonne of oil equivalent.
@@ -71,6 +74,18 @@ def _ac_bus(n: pypsa.Network, country: str) -> str | None:
     return str(buses[0])
 
 
+def _electrical_capacity_mask(
+    n: pypsa.Network, assets: pd.DataFrame, bus_column: str
+) -> pd.Series:
+    """Assets whose output bus is electricity.
+
+    Biogas, solid biomass and gas supply generators keep an annual energy
+    potential in ``p_nom``. That number is not a power-plant rating, so the
+    Current Policies electrical share must not scale it.
+    """
+    return assets[bus_column].map(n.buses.carrier).isin(_ELECTRICITY_CARRIERS)
+
+
 def derate_existing_to_cps(
     n: pypsa.Network, config: dict, planning_horizons: str | None
 ) -> None:
@@ -108,6 +123,9 @@ def derate_existing_to_cps(
             online = assets["build_year"] + assets["lifetime"] >= year
             undated = assets["build_year"].isna() | assets["lifetime"].isna()
             assets = assets.loc[online | undated]
+        assets = assets.loc[_electrical_capacity_mask(n, assets, bus_column)]
+        if assets.empty:
+            continue
         country = assets[bus_column].map(n.buses.country)
         carrier = assets["carrier"].replace(rename)
         electrical = assets["p_nom"].fillna(0.0)
@@ -490,6 +508,152 @@ def _co2_weights(n: pypsa.Network) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("link")
 
 
+def _replace_co2_target(
+    targets: dict[str, float], name: str, value: float, reason: str
+) -> None:
+    published = targets[name]
+    if abs(published - value) <= 0.05:
+        return
+    targets[name] = value
+    logger.info(
+        "Combustion CO2 from %s is set to %.1f Mt. The published figure is %.0f Mt, "
+        "and %s.",
+        name.replace("_", " "),
+        value,
+        published,
+        reason,
+    )
+
+
+def reconcile_co2_with_fuel_use(n: pypsa.Network, year: int) -> dict[str, float]:
+    """
+    Move a CO2 total onto the emissions the fixed fuel use can actually produce.
+
+    Oil power plants share one factor, so 21 TWh cannot emit 19 Mt. Transport
+    oil, including biofuels burned as oil, emits more than the transport row.
+    Final coal has no plant beyond industry and the coal boilers. The fuel
+    total keeps the published other-energy residual on top of those rows.
+    """
+    config = getattr(n, "config", None) or {}
+    spec = config.get("iea_co2") or {}
+    names = (
+        "coal",
+        "oil",
+        "gas",
+        "power_coal",
+        "power_oil",
+        "power_gas",
+        "final_coal",
+        "final_oil",
+        "final_gas",
+        "transport_oil",
+    )
+    published = {name: published_value(spec[name], year) for name in names}
+    targets = dict(published)
+    final = config.get("iea_final") or {}
+    generation = config.get("iea_generation") or {}
+    weights = _co2_weights(n)
+    if weights.empty:
+        return targets
+
+    def row(sector: str, fuel: str) -> float:
+        pair = (final.get(sector) or {}).get(fuel)
+        if not pair:
+            return 0.0
+        early = float(pair.get(2030, pair.get("2030", 0)) or 0)
+        late = float(pair.get(2040, pair.get("2040", 0)) or 0)
+        if early == 0 and late == 0:
+            return 0.0
+        return published_value(pair, year)
+
+    def tonnes_per_mwh(carrier_text: str) -> float:
+        carriers = n.links.carrier.reindex(weights.index).astype(str)
+        chosen = weights.index[carriers.str.contains(carrier_text, case=False, regex=False)]
+        if len(chosen) == 0:
+            return 0.0
+        return float(weights.loc[chosen, "coeff"].median())
+
+    def mt_from_mtoe(mtoe: float, coeff: float) -> float:
+        return mtoe * MWH_PER_MTOE * coeff / 1e6
+
+    oil_burn = tonnes_per_mwh("land transport oil")
+    transport_mt = mt_from_mtoe(row("transport", "oil") + row("transport", "biofuels"), oil_burn)
+    _replace_co2_target(
+        targets,
+        "transport_oil",
+        transport_mt,
+        "the transport fuel row burns at the model's oil factor",
+    )
+
+    power = weights[weights["fuel"].eq("oil") & weights["power"].gt(0)]
+    oil_twh = generation.get("oil")
+    if len(power) and oil_twh:
+        electrical = n.links.efficiency.reindex(power.index).astype(float).replace(0, pd.NA)
+        intensity = float((power["coeff"] * power["power"] / electrical).median())
+        _replace_co2_target(
+            targets,
+            "power_oil",
+            published_value(oil_twh, year) * intensity,
+            "every oil plant emits the same amount per megawatt-hour",
+        )
+
+    final_oil_floor = (
+        transport_mt
+        + mt_from_mtoe(row("buildings", "oil"), tonnes_per_mwh("oil boiler"))
+        + mt_from_mtoe(row("industry", "oil"), tonnes_per_mwh("naphtha"))
+    )
+    if targets["final_oil"] < final_oil_floor - 0.05:
+        _replace_co2_target(
+            targets,
+            "final_oil",
+            final_oil_floor,
+            "industry, buildings and transport oil already emit more than that",
+        )
+
+    coal_carriers = set(
+        n.links.carrier.reindex(
+            weights.index[weights["fuel"].eq("coal") & weights["final"].gt(0)]
+        ).astype(str)
+    )
+    boiler_coeff = tonnes_per_mwh("coal boiler") or tonnes_per_mwh("coal for industry")
+    final_coal_locked = mt_from_mtoe(
+        row("industry", "coal"), tonnes_per_mwh("coal for industry")
+    ) + mt_from_mtoe(row("buildings", "coal"), boiler_coeff)
+    free_coal = [
+        carrier
+        for carrier in coal_carriers
+        if "boiler" not in carrier.lower() and "industry" not in carrier.lower()
+    ]
+    if not free_coal and targets["final_coal"] > final_coal_locked + 0.05:
+        _replace_co2_target(
+            targets,
+            "final_coal",
+            final_coal_locked,
+            "industry and coal boilers are the only final coal plants",
+        )
+
+    gas_floor = mt_from_mtoe(
+        row("industry", "gas"), tonnes_per_mwh("gas for industry")
+    ) + mt_from_mtoe(row("buildings", "gas"), tonnes_per_mwh("gas boiler"))
+    if targets["final_gas"] < gas_floor - 0.05:
+        _replace_co2_target(
+            targets,
+            "final_gas",
+            gas_floor,
+            "industry and gas boilers already emit more than that",
+        )
+
+    for fuel in ("coal", "oil", "gas"):
+        other = published[fuel] - published[f"power_{fuel}"] - published[f"final_{fuel}"]
+        _replace_co2_target(
+            targets,
+            fuel,
+            targets[f"power_{fuel}"] + targets[f"final_{fuel}"] + other,
+            "power, final and the other-energy residual have to add up",
+        )
+    return targets
+
+
 def add_iea_combustion_co2_constraints(
     n: pypsa.Network, planning_horizons: str | None
 ) -> None:
@@ -513,6 +677,7 @@ def add_iea_combustion_co2_constraints(
     year = int(planning_horizons)
     snapshot_weight = n.snapshot_weightings.generators
     nyears = _nyears(n)
+    reconciled = reconcile_co2_with_fuel_use(n, year)
     groups = {
         "coal": (weights["fuel"].eq("coal"), None),
         "oil": (weights["fuel"].eq("oil"), None),
@@ -545,7 +710,7 @@ def add_iea_combustion_co2_constraints(
                 flow.loc[:, link_name] * float(coeff.at[link_name]) * snapshot_weight
             ).sum()
             energy = term if energy is None else energy + term
-        mt = published_value(pair, year)
+        mt = reconciled.get(name, published_value(pair, year))
         n.model.add_constraints(energy == mt * 1e6 * nyears, name=f"iea_co2_{name}")
         logger.info("Combustion CO2 from %s is fixed at %.0f Mt.", name.replace("_", " "), mt)
 
@@ -611,9 +776,13 @@ def lift_geothermal_if_energy_exceeds_capacity(
 
     One gigawatt running every hour produces 8.76 TWh. The 2030 row is 1 GW
     and 9 TWh, so the fleet is scaled up, in proportion to the plants already
-    there, until full-load operation can meet the energy. The capacity limit
-    is moved to that same fleet. Later years are left on the published gigawatts
-    when those gigawatts can produce the energy.
+    there, until full-load operation is a little above the energy. The annual
+    equality is what forces that energy, so the plants are not held at full
+    load: minimum energy stays below the target and maximum stays above it.
+    The capacity limit is moved to that same fleet. A later year is left
+    alone only when the plants themselves can produce the energy. The
+    published gigawatts are not enough of a check: the file can allow more
+    capacity than the fleet that was actually built.
     """
     if planning_horizons is None or n.generators.empty:
         return
@@ -632,8 +801,6 @@ def lift_geothermal_if_energy_exceeds_capacity(
         return
     published_mw = float(block["max"].xs("geothermal", level="carrier").sum())
     required_mw = twh / 8.76 * 1000.0
-    if required_mw <= published_mw * (1 + 1e-6):
-        return
     idx = n.generators.index[n.generators.carrier.eq("geothermal")]
     if idx.empty:
         logger.warning(
@@ -643,17 +810,25 @@ def lift_geothermal_if_energy_exceeds_capacity(
             required_mw / 1000.0,
         )
         return
+    installed = pd.to_numeric(n.generators.loc[idx, "p_nom"], errors="coerce")
+    if "p_nom_max" in n.generators.columns:
+        finite = pd.to_numeric(n.generators.loc[idx, "p_nom_max"], errors="coerce")
+        finite = finite.mask(finite.abs() == float("inf"))
+        installed = installed.where(finite.isna(), finite)
+    if float(installed.sum()) + 1e-6 >= required_mw:
+        return
     weights = n.generators.loc[idx, "p_nom"].fillna(0.0).clip(lower=0.0)
     if float(weights.sum()) <= 0:
         weights = pd.Series(1.0, index=idx)
-    lifted = weights / float(weights.sum()) * required_mw
-    original = n.generators.loc[idx, "p_nom"].fillna(0.0)
-    n.generators.loc[idx, "p_nom"] = original.clip(upper=lifted)
+    # Full load sits a little above the published terawatt-hours. The annual
+    # equality is the target, and the plants have to be able to run below it.
+    lifted = weights / float(weights.sum()) * required_mw * (1 + 1e-6)
+    n.generators.loc[idx, "p_nom"] = lifted
     n.generators.loc[idx, "p_nom_min"] = lifted
     n.generators.loc[idx, "p_nom_max"] = lifted
     n.generators.loc[idx, "p_nom_extendable"] = True
     n.generators.loc[idx, "p_max_pu"] = 1.0
-    n.generators.loc[idx, "p_min_pu"] = 1.0
+    n.generators.loc[idx, "p_min_pu"] = 0.0
     for attr in ("p_max_pu", "p_min_pu"):
         profile = getattr(n.generators_t, attr, None)
         if profile is None or profile.empty:
@@ -669,11 +844,13 @@ def lift_geothermal_if_energy_exceeds_capacity(
         override[(code, "geothermal")] = float(group.sum())
     n._iea_capacity_override = override
     logger.info(
-        "Geothermal capacity is raised from %.3f GW to %.3f GW so %.1f TWh "
-        "can be generated at full load.",
-        published_mw / 1000.0,
-        required_mw / 1000.0,
+        "Geothermal capacity is raised from %.3f GW to %.3f GW so full load "
+        "is above %.1f TWh and the plants can run below that total. "
+        "The published cap is %.3f GW.",
+        float(installed.sum()) / 1000.0,
+        float(lifted.sum()) / 1000.0,
         twh,
+        published_mw / 1000.0,
     )
 
 
@@ -808,6 +985,495 @@ def add_other_energy_sector(
         )
 
 
+def _energy_per_mw(n: pypsa.Network, names: pd.Index) -> float:
+    """Megawatt-hours a plant can produce per megawatt, weighted across plants."""
+    if len(names) == 0:
+        return 0.0
+    weight = n.snapshot_weightings.generators
+    plants = n.generators.loc[names]
+    sizes = plants["p_nom"].fillna(0.0).clip(lower=0.0)
+    if float(sizes.sum()) <= 0:
+        sizes = pd.Series(1.0, index=plants.index)
+    profile = n.generators_t.p_max_pu
+    total = 0.0
+    for name, size in sizes.items():
+        if name in profile.columns:
+            per_mw = float((profile[name] * weight).sum())
+        else:
+            per_mw = float(plants.at[name, "p_max_pu"]) * float(weight.sum())
+        total += per_mw * float(size)
+    return total / float(sizes.sum())
+
+
+def _capacity_limits(n: pypsa.Network, config: dict, year: int) -> pd.Series | None:
+    options = config.get("solving", {}).get("agg_p_nom_limits") or {}
+    if not options.get("file"):
+        return None
+    from scripts.solve_network import _ccl_horizon_block
+
+    table = pd.read_csv(options["file"], index_col=[0, 1], header=[0, 1])
+    block = _ccl_horizon_block(table, year)
+    caps = block["max"].dropna()
+    override = getattr(n, "_iea_capacity_override", None) or {}
+    for key, value in override.items():
+        caps.loc[key] = value[1] if isinstance(value, tuple) else value
+    return caps
+
+
+def lift_weather_limited_generation(
+    n: pypsa.Network, config: dict, planning_horizons: str | None
+) -> None:
+    """
+    Raise a capacity limit when the weather year cannot produce the terawatt-hours.
+
+    The published gigawatts stay the minimum. The maximum is scaled, by the
+    same factor in every country, until the availability profiles can reach
+    the electricity total. Nuclear uses the same rule for plant availability.
+    """
+    if planning_horizons is None or n.generators.empty:
+        return
+    spec = config.get("iea_generation") or {}
+    if not spec.get("enable"):
+        return
+    year = int(planning_horizons)
+    groups = {
+        "wind": {
+            "onwind": {"onwind"},
+            "offwind-all": {"offwind", "offwind-ac", "offwind-dc", "offwind-float"},
+        },
+        "solar": {
+            "solar-all": {"solar", "solar-hsat", "solar rooftop", "csp"},
+        },
+        "nuclear": {},
+    }
+    caps = _capacity_limits(n, config, year)
+    if caps is None:
+        return
+    nyears = _nyears(n)
+    override = dict(getattr(n, "_iea_capacity_override", {}))
+
+    for name, aggregates in groups.items():
+        pair = spec.get(name)
+        if not pair:
+            continue
+        target = published_value(pair, year) * 1e6 * nyears
+        if name == "nuclear":
+            plants = n.generators.index[n.generators.carrier.eq("nuclear")]
+            if plants.empty:
+                continue
+            available = 0.0
+            for plant in plants:
+                available += _energy_per_mw(n, pd.Index([plant])) * float(
+                    n.generators.at[plant, "p_nom_max"]
+                )
+            if available >= target:
+                continue
+            scale = target / available * (1 + 1e-6)
+            n.generators.loc[plants, "p_nom_max"] = (
+                n.generators.loc[plants, "p_nom_max"] * scale
+            )
+            country = n.generators.loc[plants, "bus"].map(n.buses.country)
+            for code, block in n.generators.loc[plants].groupby(country):
+                if pd.isna(code) or (code, "nuclear") not in caps.index:
+                    continue
+                published = float(caps.loc[(code, "nuclear")])
+                override[(code, "nuclear")] = (
+                    published,
+                    float(n.generators.loc[block.index, "p_nom_max"].sum()),
+                )
+            logger.info(
+                "Nuclear capacity is raised by %.2f%% so plant availability can "
+                "generate %.1f TWh.",
+                (scale - 1) * 100,
+                target / 1e6 / nyears,
+            )
+            continue
+
+        available = 0.0
+        country_caps: list[tuple[str, str, float]] = []
+        for aggregate, carriers in aggregates.items():
+            plants = n.generators.index[n.generators.carrier.isin(carriers)]
+            if plants.empty or aggregate not in set(caps.index.get_level_values("carrier")):
+                continue
+            chosen = n.generators.loc[plants]
+            for code, block in chosen.groupby(chosen.bus.map(n.buses.country)):
+                key = (code, aggregate)
+                if pd.isna(code) or key not in caps.index:
+                    continue
+                cap = float(caps.loc[key])
+                available += _energy_per_mw(n, block.index) * cap
+                country_caps.append((str(code), aggregate, cap))
+        if not country_caps or available >= target:
+            continue
+        scale = target / available * (1 + 1e-6)
+        for code, aggregate, cap in country_caps:
+            override[(code, aggregate)] = (cap, cap * scale)
+            plants = n.generators.index[
+                n.generators.carrier.isin(aggregates[aggregate])
+            ]
+            country = n.generators.loc[plants, "bus"].map(n.buses.country)
+            local = plants[country.eq(code).to_numpy()]
+            extendable_flag = (
+                n.generators.loc[local, "p_nom_extendable"].fillna(False).astype(bool)
+            )
+            extendable = local[extendable_flag.to_numpy()]
+            if len(extendable) == 0:
+                continue
+            fixed = float(
+                n.generators.loc[local.difference(extendable), "p_nom"].fillna(0).sum()
+            )
+            room = max(0.0, cap * scale - fixed)
+            have = float(
+                n.generators.loc[extendable, "p_nom_max"].clip(upper=1e12).sum()
+            )
+            if have >= room:
+                continue
+            weights = n.generators.loc[extendable, "p_nom"].fillna(0).clip(lower=0)
+            if float(weights.sum()) <= 0:
+                weights = pd.Series(1.0, index=extendable)
+            n.generators.loc[extendable, "p_nom_max"] = (
+                weights / float(weights.sum()) * room
+            )
+        logger.info(
+            "%s capacity is raised by %.1f%% so the weather year can generate "
+            "%.1f TWh. At the published gigawatts the profiles reach %.1f TWh.",
+            name.capitalize(),
+            (scale - 1) * 100,
+            target / 1e6 / nyears,
+            available / 1e6 / nyears,
+        )
+    n._iea_capacity_override = override
+
+
+def lift_hydro_inflow_to_published_energy(
+    n: pypsa.Network, config: dict, planning_horizons: str | None
+) -> None:
+    """
+    Add reservoir water when the weather year is below the hydro total.
+
+    Run-of-river is already at its availability in some hours, so it is not
+    scaled. The missing energy is added to reservoir inflow, in proportion to
+    the water already there. Pumped storage is not hydro generation.
+    """
+    if planning_horizons is None:
+        return
+    spec = config.get("iea_generation") or {}
+    pair = spec.get("hydro") if spec.get("enable") else None
+    if not pair:
+        return
+    year = int(planning_horizons)
+    nyears = _nyears(n)
+    target = published_value(pair, year) * 1e6 * nyears
+    weight = n.snapshot_weightings.generators
+    ror = n.generators.index[n.generators.carrier.eq("ror")] if not n.generators.empty else []
+    ror_energy = _energy_per_mw(n, pd.Index(ror)) * float(
+        n.generators.loc[ror, "p_nom"].fillna(0).sum()
+    ) if len(ror) else 0.0
+    if n.storage_units.empty or "hydro" not in set(n.storage_units.carrier):
+        inflow_energy = 0.0
+        hydro = pd.Index([])
+    else:
+        hydro = n.storage_units.index[n.storage_units.carrier.eq("hydro")]
+        inflow = n.storage_units_t.inflow.reindex(columns=hydro).fillna(0.0)
+        inflow_energy = float((inflow.mul(weight, axis=0)).sum().sum())
+    available = ror_energy + inflow_energy
+    if available >= target or inflow_energy <= 0:
+        if available < target:
+            logger.warning(
+                "Hydro generation of %.1f TWh needs %.1f TWh more water, and "
+                "there is no reservoir inflow to raise.",
+                target / 1e6 / nyears,
+                (target - available) / 1e6 / nyears,
+            )
+        return
+    scale = (target - ror_energy) / inflow_energy * (1 + 1e-6)
+    n.storage_units_t.inflow.loc[:, hydro] = (
+        n.storage_units_t.inflow.loc[:, hydro].fillna(0.0) * scale
+    )
+    logger.info(
+        "Reservoir hydro inflow is raised by %.1f%%. Run-of-river can generate "
+        "%.1f TWh and the weather year has %.1f TWh of water, against %.1f TWh.",
+        (scale - 1) * 100,
+        ror_energy / 1e6 / nyears,
+        available / 1e6 / nyears,
+        target / 1e6 / nyears,
+    )
+
+
+def remove_agriculture_oil_outside_the_oil_rows(n: pypsa.Network) -> None:
+    """Drop agriculture oil that sits on top of the allocated oil rows.
+
+    Transport, buildings and industry already take the whole final-oil row.
+    The extra machinery load cannot burn inside that carbon total, so the
+    solved 2030 network shed it, about 100 TWh, at the load-shedding price.
+    """
+    loads = _load_index(n, ["agriculture machinery oil"])
+    if len(loads) == 0:
+        return
+    removed = _load_energy_mwh(n, loads)
+    if removed <= 1.0:
+        return
+    timed = n.loads_t.p_set
+    for load in loads:
+        n.loads.at[load, "p_set"] = 0.0
+        if load in timed.columns:
+            timed[load] = 0.0
+    logger.info(
+        "Agriculture machinery oil of %.1f TWh is removed. Transport, buildings "
+        "and industry already use the whole oil row, and the solved network "
+        "was shedding this extra demand.",
+        removed / 1e6,
+    )
+
+
+def _positive_efficiencies(n: pypsa.Network, carriers: set[str]) -> pd.Series:
+    if n.links.empty or "efficiency" not in n.links.columns:
+        return pd.Series(dtype=float)
+    chosen = n.links.index[n.links.carrier.isin(carriers)]
+    if len(chosen) == 0:
+        return pd.Series(dtype=float)
+    efficiency = pd.to_numeric(n.links.loc[chosen, "efficiency"], errors="coerce")
+    return efficiency[efficiency > 0]
+
+
+def raise_solid_biomass_ceiling(
+    n: pypsa.Network, config: dict, planning_horizons: str | None
+) -> None:
+    """Raise the solid-biomass cap when the imposed rows need more fuel.
+
+    The 2030 solution used the whole potential, 1,099 TWh, and shed another
+    943 TWh. Biomass electricity at the CHP efficiency, building bioenergy
+    and industry bioenergy together ask for about twice that. The ceiling is
+    an upper bound, so the extra potential is used only as far as those rows
+    require. The unsustainable equality is left as published by the potential.
+    """
+    if planning_horizons is None:
+        return
+    year = int(planning_horizons)
+    nyears = _nyears(n)
+    final = config.get("iea_final") or {}
+    generation = config.get("iea_generation") or {}
+    buildings = 0.0
+    if final.get("enable"):
+        buildings = _row_mtoe(final, "buildings", "bioenergy", year) * MWH_PER_MTOE * nyears
+    industry_loads = _load_index(n, ["solid biomass for industry"])
+    industry = _load_energy_mwh(n, industry_loads) if len(industry_loads) else 0.0
+    industry_eff = _positive_efficiencies(n, {"solid biomass for industry"})
+    if industry > 0 and len(industry_eff):
+        industry = industry / float(industry_eff.min())
+    elif industry <= 0 and final.get("enable"):
+        industry = _row_mtoe(final, "industry", "bioenergy", year) * MWH_PER_MTOE * nyears
+    electricity = 0.0
+    if generation.get("enable") and generation.get("biomass"):
+        electricity = published_value(generation["biomass"], year) * 1e6 * nyears
+    chp_eff = _positive_efficiencies(
+        n,
+        {
+            "urban central solid biomass CHP",
+            "urban central solid biomass CHP CC",
+            "biomass",
+        },
+    )
+    fuel_for_electricity = 0.0
+    if electricity > 0 and len(chp_eff):
+        # The least efficient plant has to be able to meet the terawatt-hours.
+        fuel_for_electricity = electricity / float(chp_eff.min())
+    elif electricity > 0:
+        logger.warning(
+            "Biomass electricity of %.1f TWh has no solid-biomass CHP efficiency, "
+            "so the fuel ceiling is not raised for it.",
+            electricity / 1e6,
+        )
+    required = buildings + industry + fuel_for_electricity
+    if required <= 0 or n.generators.empty:
+        return
+    supply = n.generators.index[n.generators.carrier.eq("solid biomass")]
+    if "e_sum_max" not in n.generators.columns or len(supply) == 0:
+        return
+    finite = n.generators.loc[supply, "e_sum_max"].replace(
+        [float("inf"), float("-inf")], pd.NA
+    )
+    finite = finite.dropna().astype(float)
+    generator_cap = float(finite.sum()) if len(finite) else 0.0
+    constraint_cap = None
+    if "biomass limit" in n.global_constraints.index:
+        constraint_cap = float(n.global_constraints.at["biomass limit", "constant"])
+    if generator_cap > 0 and constraint_cap is not None:
+        sustainable = min(generator_cap, constraint_cap)
+    elif generator_cap > 0:
+        sustainable = generator_cap
+    elif constraint_cap is not None:
+        sustainable = constraint_cap
+    else:
+        return
+    unsustainable = 0.0
+    if "unsustainable biomass limit" in n.global_constraints.index:
+        unsustainable = float(
+            n.global_constraints.at["unsustainable biomass limit", "constant"]
+        )
+    available = sustainable + max(unsustainable, 0.0)
+    if required <= available * (1 + 1e-6):
+        return
+    new_sustainable = required * (1 + 1e-4) - max(unsustainable, 0.0)
+    if generator_cap > 0 and len(finite):
+        factor = new_sustainable / generator_cap
+        n.generators.loc[finite.index, "e_sum_max"] = finite * factor
+        same_units = n.generators.loc[finite.index, "p_nom"].astype(float)
+        matched = (same_units - finite).abs() <= 1.0
+        chosen = matched.index[matched.to_numpy()]
+        n.generators.loc[chosen, "p_nom"] = n.generators.loc[chosen, "e_sum_max"]
+    if "biomass limit" in n.global_constraints.index:
+        n.global_constraints.at["biomass limit", "constant"] = new_sustainable
+    logger.info(
+        "Solid biomass ceiling is raised from %.1f TWh to %.1f TWh. "
+        "Electricity, buildings and industry need %.1f TWh of fuel and the "
+        "potentials provide %.1f TWh, of which %.1f TWh is the unsustainable equality.",
+        sustainable / 1e6,
+        new_sustainable / 1e6,
+        required / 1e6,
+        available / 1e6,
+        max(unsustainable, 0.0) / 1e6,
+    )
+
+
+def _mtoe_share(spec: dict, sector: str, fuel: str, others: list[str], year: int) -> float:
+    """Share of a final-energy fuel that belongs to one sector."""
+    own = _row_mtoe(spec, sector, fuel, year)
+    total = own + sum(_row_mtoe(spec, other, fuel, year) for other in others)
+    if total <= 0:
+        return 0.0
+    return own / total
+
+
+def industry_co2_target_mt(config: dict, year: int) -> float:
+    """
+    Industry share of the published final CO2 rows, in megatonnes.
+
+    Current Policies publishes final CO2 by fuel, not a separate industry
+    total. Coal and gas are split with buildings by their final-energy rows.
+    Oil drops the published transport row first, then splits the remainder
+    with buildings.
+    """
+    final = config.get("iea_final") or {}
+    co2 = config.get("iea_co2") or {}
+    if not co2:
+        return 0.0
+    coal = _mtoe_share(final, "industry", "coal", ["buildings"], year)
+    gas = _mtoe_share(final, "industry", "gas", ["buildings"], year)
+    oil_energy = _row_mtoe(final, "industry", "oil", year) + _row_mtoe(final, "buildings", "oil", year)
+    oil_share = 0.0
+    if oil_energy > 0:
+        oil_share = _row_mtoe(final, "industry", "oil", year) / oil_energy
+    total = 0.0
+    if "final_coal" in co2:
+        total += coal * published_value(co2["final_coal"], year)
+    if "final_gas" in co2:
+        total += gas * published_value(co2["final_gas"], year)
+    if "final_oil" in co2 and "transport_oil" in co2:
+        non_transport = published_value(co2["final_oil"], year) - published_value(co2["transport_oil"], year)
+        total += oil_share * non_transport
+    return total
+
+
+def _industry_fuel_co2_mt(n: pypsa.Network, config: dict, year: int) -> float:
+    """CO2 the fixed industry coal, gas and naphtha rows emit to the atmosphere."""
+    spec = config.get("iea_final") or {}
+    atmosphere = _atmosphere_efficiency(n)
+    carriers = {
+        "coal": "coal for industry",
+        "gas": "gas for industry",
+        "oil": "naphtha for industry",
+    }
+    total = 0.0
+    for fuel, carrier in carriers.items():
+        mtoe = _row_mtoe(spec, "industry", fuel, year)
+        links = n.links.index[n.links.carrier.astype(str).eq(carrier)] if not n.links.empty else []
+        if mtoe <= 0 or len(links) == 0:
+            continue
+        delivered = n.links.loc[links, "efficiency"].astype(float).replace(0, pd.NA)
+        per_mwh = (atmosphere.reindex(links) / delivered).astype(float).dropna()
+        if per_mwh.empty:
+            continue
+        total += mtoe * MWH_PER_MTOE * float(per_mwh.median()) / 1e6
+    return total
+
+
+def _process_co2_mt(n: pypsa.Network) -> float:
+    """Process CO2 from the industrial load plus the naphtha steam-cracker slice."""
+    loads = (
+        n.loads.index[n.loads.carrier.astype(str).eq("process emissions")]
+        if not n.loads.empty
+        else pd.Index([])
+    )
+    from_load = -_load_energy_mwh(n, loads) if len(loads) else 0.0
+    feedstock = 0.0
+    oil = _load_energy_mwh(n, _load_index(n, ["naphtha for industry"]))
+    if not n.links.empty and oil:
+        links = n.links.index[n.links.carrier.astype(str).eq("naphtha for industry")]
+        if len(links) and "efficiency2" in n.links.columns:
+            delivered = n.links.loc[links, "efficiency"].astype(float).replace(0, pd.NA)
+            ratio = (n.links.loc[links, "efficiency2"].astype(float) / delivered).dropna()
+            if not ratio.empty:
+                feedstock = oil * float(ratio.median())
+    return (from_load + feedstock) / 1e6 / _nyears(n)
+
+
+def _scale_load_values(n: pypsa.Network, loads: pd.Index, factor: float) -> None:
+    timed = n.loads_t.p_set
+    for load in loads:
+        if load in timed.columns and timed[load].notna().any():
+            n.loads_t.p_set[load] = timed[load].fillna(0.0) * factor
+        else:
+            n.loads.at[load, "p_set"] = float(n.loads.at[load, "p_set"]) * factor
+
+
+def scale_process_emissions_to_industry_co2(
+    n: pypsa.Network, config: dict, planning_horizons: str | None
+) -> None:
+    """
+    Scale process CO2 so industry fuel plus process CO2 matches the industry share.
+
+    The fuel rows stay at the published megatonnes of oil equivalent. Process
+    emissions, including the steam-cracker slice of naphtha, take the remainder
+    of the industry share. Plastic-waste CO2 on the naphtha link stays in the
+    oil row.
+    """
+    if planning_horizons is None or not (config.get("iea_co2") or {}).get("enable"):
+        return
+    if not (config.get("iea_final") or {}).get("enable"):
+        return
+    year = int(planning_horizons)
+    target = industry_co2_target_mt(config, year)
+    fuel = _industry_fuel_co2_mt(n, config, year)
+    current = _process_co2_mt(n)
+    if current <= 1e-6:
+        logger.warning("No process emissions are available to match the industry CO2 share.")
+        return
+    remainder = target - fuel
+    factor = 0.0 if remainder <= 0 else remainder / current
+    loads = (
+        n.loads.index[n.loads.carrier.astype(str).eq("process emissions")]
+        if not n.loads.empty
+        else pd.Index([])
+    )
+    if len(loads):
+        _scale_load_values(n, loads, factor)
+    links = (
+        n.links.index[n.links.carrier.astype(str).eq("naphtha for industry")]
+        if not n.links.empty
+        else pd.Index([])
+    )
+    if len(links) and "efficiency2" in n.links.columns:
+        n.links.loc[links, "efficiency2"] = n.links.loc[links, "efficiency2"].astype(float) * factor
+    logger.info(
+        "Process emissions are scaled by %.3f. Industry fuel emits %.1f Mt and "
+        "the industry share of the final CO2 rows is %.1f Mt.",
+        factor,
+        fuel,
+        target,
+    )
+
+
 def prepare_iea_cps(
     n: pypsa.Network, config: dict, planning_horizons: str | None
 ) -> None:
@@ -817,4 +1483,9 @@ def prepare_iea_cps(
     add_coal_boilers(n, config)
     add_other_energy_sector(n, config, planning_horizons)
     scale_iea_final_loads(n, config, planning_horizons)
+    scale_process_emissions_to_industry_co2(n, config, planning_horizons)
+    remove_agriculture_oil_outside_the_oil_rows(n)
+    raise_solid_biomass_ceiling(n, config, planning_horizons)
     lift_geothermal_if_energy_exceeds_capacity(n, config, planning_horizons)
+    lift_weather_limited_generation(n, config, planning_horizons)
+    lift_hydro_inflow_to_published_energy(n, config, planning_horizons)

@@ -30,13 +30,66 @@ import atlite
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+import rasterio
 import xarray as xr
 from atlite.gis import shape_availability
+from rasterio.io import MemoryFile
 from rasterio.plot import show
 
 from scripts._helpers import configure_logging, load_cutout, set_scenario_config
 
 logger = logging.getLogger(__name__)
+
+
+def _drop_subnormals(array):
+    values = np.array(array, copy=True)
+    if np.issubdtype(values.dtype, np.floating):
+        values[np.abs(values) < 1e-6] = 0
+    return values
+
+
+def use_geotiff_for_memory_warps() -> None:
+    """Warp in-memory masks through a GeoTIFF.
+
+    GDAL 3.13 writes a numpy mask into a float destination as stray
+    bytes, so ``astype(bool)`` then excludes every offshore cell.
+    """
+    import atlite.gis as gis
+
+    original = gis.rio.warp.reproject
+
+    def reproject(source, destination, *args, **kwargs):
+        if isinstance(source, np.ndarray):
+            src = np.ascontiguousarray(source)
+            if src.ndim == 3 and src.shape[0] == 1:
+                src = src[0]
+            if src.dtype == np.bool_:
+                src = src.astype(np.uint8)
+            profile = {
+                "driver": "GTiff",
+                "height": src.shape[-2],
+                "width": src.shape[-1],
+                "count": 1,
+                "dtype": src.dtype.name,
+                "crs": kwargs.pop("src_crs", None),
+                "transform": kwargs.pop("src_transform", None),
+            }
+            # float64 destinations come back with stray subnormal bytes on
+            # GDAL 3.13, and those bytes are truthy in the exclusion mask.
+            dest = np.zeros(np.shape(destination), dtype=np.float32)
+            with MemoryFile() as mem:
+                with mem.open(**profile) as dataset:
+                    dataset.write(src, 1)
+                with mem.open() as dataset:
+                    out, transform = original(
+                        rasterio.band(dataset, 1), dest, *args, **kwargs
+                    )
+            return _drop_subnormals(out), transform
+        dest = np.zeros(np.shape(destination), dtype=np.float32)
+        out, transform = original(source, dest, *args, **kwargs)
+        return _drop_subnormals(out), transform
+
+    gis.rio.warp.reproject = reproject
 
 
 if __name__ == "__main__":
@@ -49,7 +102,6 @@ if __name__ == "__main__":
     configure_logging(snakemake)
     set_scenario_config(snakemake)
 
-    nprocesses = int(snakemake.threads)
     noprogress = snakemake.params.disable_progressbar
     noprogress = noprogress or not snakemake.params.show_progress
     technology = snakemake.wildcards.technology
@@ -129,7 +181,10 @@ if __name__ == "__main__":
     logger.info(f"Calculate landuse availability for {technology}...")
     start = time.time()
 
-    kwargs = {"nprocesses": nprocesses, "disable_progressbar": noprogress}
+    # The warp fix lives in this process. A spawned worker would import a
+    # fresh atlite and hit the broken in-memory reprojection again.
+    use_geotiff_for_memory_warps()
+    kwargs = {"nprocesses": None, "disable_progressbar": noprogress}
     availability = cutout.availabilitymatrix(regions, excluder, **kwargs)
 
     duration = time.time() - start

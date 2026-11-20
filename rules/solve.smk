@@ -12,6 +12,9 @@ rule solve_network:
             if config.get("co2_budget_national", {}).get("enable")
             else []
         ),
+        # Imported by the solve. Listed so a change in the Current Policies
+        # constraints solves the networks again.
+        iea_constraints="scripts/iea_cps_constraints.py",
     output:
         network=RESULTS + "networks/solved_{horizon}.nc",
         model=(

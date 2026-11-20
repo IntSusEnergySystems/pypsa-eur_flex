@@ -129,8 +129,12 @@ def add_existing_renewables(
         for country, group in carrier_gens.groupby(
             carrier_gens.bus.map(n.buses.country)
         ):
+            if country not in df.index or not group.p_nom_max.sum():
+                continue
             fraction = group.p_nom_max / group.p_nom_max.sum()
             res_capacities.append(cartesian(df.loc[country], fraction))
+        if not res_capacities:
+            continue
         res_capacities = pd.concat(res_capacities, axis=1).T
 
         for year in res_capacities.columns:

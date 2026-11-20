@@ -162,6 +162,18 @@ rule all:
         (expand(MYOPIC_OUTPUTS, run=config["run"]["name"]) if MYOPIC_OUTPUTS else []),
         sector_network_plot_paths,
         balance_map_paths,
+        expand(
+            RESULTS + "figures/.statistics_plots_{horizon}",
+            run=config["run"]["name"],
+            horizon=config["planning_horizons"],
+        ),
+        expand(
+            [
+                RESULTS + "iea_comparison/eu_comparison.csv",
+                RESULTS + "iea_comparison/abatement_curve.png",
+            ],
+            run=config["run"]["name"],
+        ),
 
 
 rule create_scenarios:

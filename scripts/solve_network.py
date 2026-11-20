@@ -650,6 +650,12 @@ def _ccl_existing_mw(
     fixed = static.loc[~static.p_nom_extendable].copy()
     if fixed.empty:
         return pd.Series(dtype=float, name="p_nom")
+    from scripts.iea_cps_constraints import _electrical_capacity_mask
+
+    bus_column = "bus" if component == "Generator" else "bus1"
+    fixed = fixed.loc[_electrical_capacity_mask(n, fixed, bus_column)]
+    if fixed.empty:
+        return pd.Series(dtype=float, name="p_nom")
     if {"build_year", "lifetime"} <= set(fixed.columns):
         fixed = fixed.loc[(fixed["build_year"] + fixed["lifetime"]) >= year]
     if fixed.empty:
@@ -678,6 +684,12 @@ def _ccl_extendable_expression(
         return None
     static = n.generators if component == "Generator" else n.links
     extendable = static.query("p_nom_extendable").copy()
+    if extendable.empty:
+        return None
+    from scripts.iea_cps_constraints import _electrical_capacity_mask
+
+    bus_column = "bus" if component == "Generator" else "bus1"
+    extendable = extendable.loc[_electrical_capacity_mask(n, extendable, bus_column)]
     if extendable.empty:
         return None
     if not PYPSA_V1:
@@ -726,7 +738,11 @@ def add_CCL_constraints(
     limits = _ccl_horizon_block(table, planning_horizons)
     override = getattr(n, "_iea_capacity_override", None) or {}
     for key, value in override.items():
-        limits.loc[key, ["min", "max"]] = value
+        if isinstance(value, tuple):
+            limits.loc[key, "min"] = value[0]
+            limits.loc[key, "max"] = value[1]
+        else:
+            limits.loc[key, ["min", "max"]] = value
     rename = _ccl_rename(limits, options)
     logger.info("Adding generation capacity constraints per carrier and country")
     year = int(planning_horizons)
@@ -1360,12 +1376,18 @@ def add_battery_constraints(n: pypsa.Network) -> None:
 
 
 def add_lossy_bidirectional_link_constraints(n: pypsa.Network) -> None:
-    if not n.links.p_nom_extendable.any() or not any(n.links.get("reversed", [])):
+    if "reversed" not in n.links.columns or not n.links.p_nom_extendable.any():
         return
 
-    carriers = n.links.loc[n.links.reversed, "carrier"].unique()  # noqa: F841
-    backwards = n.links.query(
-        "carrier in @carriers and p_nom_extendable and reversed and active"
+    # Links that were never split have no direction, so the column is missing
+    # there. Pandas 3 will not use NA as a boolean mask.
+    reversed_links = n.links["reversed"].fillna(False).astype(bool)
+    if not reversed_links.any():
+        return
+
+    carriers = n.links.loc[reversed_links, "carrier"].unique()  # noqa: F841
+    backwards = n.links.loc[reversed_links].query(
+        "carrier in @carriers and p_nom_extendable and active"
     ).index
     forwards = backwards.str.replace("-reversed", "")
     lhs = n.model["Link-p_nom"].loc[backwards]
@@ -1622,9 +1644,10 @@ def add_iea_generation_constraints(
     nyears = float(weightings.sum()) / 8760.0
     electricity = {"AC", "low voltage"}
 
+    skipped = set(filter(None, os.environ.get("IEA_RELAX_GENERATION", "").split(",")))
     for name, (kind, carriers) in groups.items():
         pair = spec.get(name)
-        if not pair:
+        if not pair or name in skipped:
             continue
         published = {}
         for key in (2030, 2040):
@@ -1635,7 +1658,17 @@ def add_iea_generation_constraints(
         if kind in {"Generator", "both"} and "Generator-p" in n.model.variables:
             idx = n.generators.index[n.generators.carrier.isin(carriers)]
             if len(idx):
+                # Fuel supply uses the same carrier names on biogas and solid
+                # biomass buses. That potential is not electrical output.
+                bus_carrier = n.generators.loc[idx, "bus"].map(n.buses.carrier)
+                idx = bus_carrier.index[bus_carrier.isin(electricity).to_numpy()]
+            if len(idx):
                 terms.append((n.model["Generator-p"].loc[:, idx] * weightings).sum())
+        if name == "hydro" and "StorageUnit-p_dispatch" in n.model.variables:
+            stores = n.storage_units.index[n.storage_units.carrier.eq("hydro")]
+            if len(stores):
+                dispatch = n.model["StorageUnit-p_dispatch"].loc[:, stores]
+                terms.append((dispatch * weightings).sum())
         if kind in {"Link", "both"} and "Link-p" in n.model.variables:
             chosen = n.links.carrier.isin(carriers)
             if chosen.any():
@@ -1643,8 +1676,15 @@ def add_iea_generation_constraints(
                 idx = bus_carrier.index[bus_carrier.isin(electricity).to_numpy()]
                 if len(idx):
                     efficiency = n.links.efficiency.reindex(idx).fillna(0)
-                    flow = n.model["Link-p"].loc[:, idx] * efficiency
-                    terms.append((flow * weightings).sum())
+                    # One link at a time. A grouped product drops plants whose
+                    # labels do not line up, and the annual total then cannot
+                    # be met.
+                    flow = None
+                    link_p = n.model["Link-p"]
+                    for link_name, factor in efficiency.items():
+                        term = (link_p.loc[:, link_name] * float(factor) * weightings).sum()
+                        flow = term if flow is None else flow + term
+                    terms.append(flow)
         if not terms:
             logger.warning(
                 "No %s plant is available for the %.0f TWh Current Policies target.",
@@ -1687,6 +1727,8 @@ def extra_functionality(
     ``snakemake.config`` are expected to be attached to the network.
     """
     config = n.config
+    if "reversed" in n.links.columns:
+        n.links["reversed"] = n.links["reversed"].fillna(False).astype(bool)
     constraints = config["solving"].get("constraints", {})
     if constraints["BAU"] and n.generators.p_nom_extendable.any():
         add_BAU_constraints(n, config)
@@ -1742,12 +1784,15 @@ def extra_functionality(
 
     iea_co2 = config.get("iea_co2") or {}
     national_co2 = config.get("co2_budget_national") or {}
-    if iea_co2.get("enable"):
+    relax = set(os.environ.get("IEA_RELAX", "").split(","))
+    if iea_co2.get("enable") and "co2" not in relax:
         add_iea_combustion_co2_constraints(n, planning_horizons)
-    elif national_co2.get("enable"):
+    elif national_co2.get("enable") and "co2" not in relax:
         add_national_co2_constraints(n, planning_horizons, snakemake)
-    add_iea_generation_constraints(n, planning_horizons)
-    add_iea_final_fuel_constraints(n, planning_horizons)
+    if "generation" not in relax:
+        add_iea_generation_constraints(n, planning_horizons)
+    if "final" not in relax:
+        add_iea_final_fuel_constraints(n, planning_horizons)
 
     if n.params.custom_extra_functionality:
         source_path = n.params.custom_extra_functionality
@@ -1842,6 +1887,9 @@ def collect_kwargs(
     # Solve kwargs
     solver_name = solving["solver"]["name"]
     solver_options = solving["solver_options"][set_of_options] if set_of_options else {}
+    if os.environ.get("IEA_TIMELIMIT"):
+        solver_options = dict(solver_options)
+        solver_options["TimeLimit"] = float(os.environ["IEA_TIMELIMIT"])
 
     solve_kwargs = {}
     solve_kwargs["solver_name"] = solver_name
@@ -2058,13 +2106,25 @@ if __name__ == "__main__":
         TerminationCondition.infeasible,
         TerminationCondition.infeasible_or_unbounded,
     ]:
-        labels = n.model.compute_infeasibilities()
-        logger.info(f"Labels:\n{labels}")
-        n.model.print_infeasibilities()
-        raise RuntimeError("Solving status 'infeasible'. Infeasibilities computed.")
+        logger.info(
+            "The model is infeasible. An irreducible set is not computed: "
+            "copying this model has been running the machine out of memory."
+        )
+        raise RuntimeError("Solving status 'infeasible'.")
 
     if status == SolverStatus.warning:
         raise RuntimeError("Solving status 'warning'. Discarding solution.")
+
+    if condition == TerminationCondition.suboptimal:
+        logger.error(
+            "The barrier stopped before the optimality tolerance. "
+            "The network is not written, so the next horizon does not inherit it."
+        )
+        raise RuntimeError("Solving status 'suboptimal'.")
+
+    if os.environ.get("IEA_TIMELIMIT"):
+        logger.info("Diagnostic stop at status %s, condition %s.", status, condition)
+        raise RuntimeError("Diagnostic time limit. No network is written.")
 
     n.meta["snakemake_config"] = dict(
         snakemake.config, wildcards=dict(snakemake.wildcards)
