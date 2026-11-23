@@ -423,10 +423,17 @@ if (COSTS_DATASET := dataset_version("costs"))["source"] in [
     "archive",
 ]:
 
+    def _cost_file(wildcards):
+        # technology-data has no 2018 file. That horizon uses the 2020 table.
+        # 2030 and later keep the file of their own year.
+        year = int(wildcards.horizon)
+        source = 2020 if year == 2018 else year
+        return storage(COSTS_DATASET["url"] + f"/costs_{source}.csv")
+
     rule retrieve_costs:
         """Retrieves technology cost assumptions for a planning horizon from technology-data."""
         input:
-            costs=storage(COSTS_DATASET["url"] + "/costs_{horizon}.csv"),
+            costs=_cost_file,
         output:
             costs=COSTS_DATASET["folder"] + "/costs_{horizon}.csv",
         run:

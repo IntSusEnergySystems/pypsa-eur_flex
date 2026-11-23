@@ -50,7 +50,11 @@ LOAD_GROUPS = {
 
 
 def published_value(pair: dict, year: int) -> float:
-    """Return the published value, with 2035 the geometric midpoint."""
+    """Return the published value, with 2035 the geometric midpoint of 2030 and 2040.
+
+    A year that is written in the table, including 2018, is used as published.
+    It is not extrapolated from 2030 and 2040.
+    """
     from scripts.solve_network import _iea_extend
 
     def _get(key: int) -> float:
@@ -58,6 +62,8 @@ def published_value(pair: dict, year: int) -> float:
             return float(pair[key])
         return float(pair[str(key)])
 
+    if year in pair or str(year) in pair:
+        return _get(year)
     return _iea_extend(_get(2030), _get(2040))[year]
 
 
@@ -208,16 +214,28 @@ def add_csp_and_marine(
             continue
         gw = published_value(pair.get("gw", pair), year)
         twh = published_value(pair.get("twh", pair), year)
-        if gw <= 0:
+        if gw <= 0 and twh <= 0:
             continue
-        cf = twh / (gw * 8.76)
-        if cf > 1:
-            logger.warning(
-                "%s needs a capacity factor of %.2f. It is held at 1.",
-                carrier,
-                cf,
-            )
+        if gw <= 0:
+            # Table A.3 prints capacity below 0.5 GW as 0. The energy row is
+            # still imposed, at the full-load capacity that can produce it.
+            gw = twh / 8.76
             cf = 1.0
+            logger.info(
+                "%s is printed as 0 GW. %.3f GW is installed so %.1f TWh can be produced.",
+                carrier,
+                gw,
+                twh,
+            )
+        else:
+            cf = twh / (gw * 8.76)
+            if cf > 1:
+                logger.warning(
+                    "%s needs a capacity factor of %.2f. It is held at 1.",
+                    carrier,
+                    cf,
+                )
+                cf = 1.0
         if carrier not in n.carriers.index:
             n.add("Carrier", carrier)
         for code, share in shares.items():
@@ -424,7 +442,13 @@ def add_iea_final_fuel_constraints(
 def _fossil_fuel(carrier: str) -> str | None:
     """Map a link carrier to coal, oil or gas. ``boiler`` is not oil."""
     name = carrier.lower()
-    if "process emission" in name or "biomass" in name or "biogas" in name or "waste" in name:
+    if (
+        "process emission" in name
+        or "refining" in name
+        or "biomass" in name
+        or "biogas" in name
+        or "waste" in name
+    ):
         return None
     if "lignite" in name or re.search(r"\bcoal\b", name):
         return "coal"
@@ -471,7 +495,8 @@ def _co2_weights(n: pypsa.Network) -> pd.DataFrame:
         heat = float(link.efficiency2) if "efficiency2" in n.links.columns else 0.0
         power_share = 0.0
         final_share = 0.0
-        if "other energy" in carrier:
+        if "other energy" in carrier or "agriculture machinery" in carrier:
+            # Agriculture oil sits outside industry, buildings and transport.
             other_share = 1.0
         elif "refining" in carrier or carrier in {"smr", "smr cc"}:
             other_share = 1.0
@@ -597,10 +622,12 @@ def reconcile_co2_with_fuel_use(n: pypsa.Network, year: int) -> dict[str, float]
             "every oil plant emits the same amount per megawatt-hour",
         )
 
+    process_mt = process_in_industry_mt(n, year)
     final_oil_floor = (
         transport_mt
         + mt_from_mtoe(row("buildings", "oil"), tonnes_per_mwh("oil boiler"))
         + mt_from_mtoe(row("industry", "oil"), tonnes_per_mwh("naphtha"))
+        + process_mt["oil"]
     )
     if targets["final_oil"] < final_oil_floor - 0.05:
         _replace_co2_target(
@@ -618,7 +645,7 @@ def reconcile_co2_with_fuel_use(n: pypsa.Network, year: int) -> dict[str, float]
     boiler_coeff = tonnes_per_mwh("coal boiler") or tonnes_per_mwh("coal for industry")
     final_coal_locked = mt_from_mtoe(
         row("industry", "coal"), tonnes_per_mwh("coal for industry")
-    ) + mt_from_mtoe(row("buildings", "coal"), boiler_coeff)
+    ) + mt_from_mtoe(row("buildings", "coal"), boiler_coeff) + process_mt["coal"]
     free_coal = [
         carrier
         for carrier in coal_carriers
@@ -634,7 +661,7 @@ def reconcile_co2_with_fuel_use(n: pypsa.Network, year: int) -> dict[str, float]
 
     gas_floor = mt_from_mtoe(
         row("industry", "gas"), tonnes_per_mwh("gas for industry")
-    ) + mt_from_mtoe(row("buildings", "gas"), tonnes_per_mwh("gas boiler"))
+    ) + mt_from_mtoe(row("buildings", "gas"), tonnes_per_mwh("gas boiler")) + process_mt["gas"]
     if targets["final_gas"] < gas_floor - 0.05:
         _replace_co2_target(
             targets,
@@ -654,15 +681,43 @@ def reconcile_co2_with_fuel_use(n: pypsa.Network, year: int) -> dict[str, float]
     return targets
 
 
+def _add_process_co2(n, flow, snapshot_weight, year: int, fuel: str, energy):
+    """Add this fuel's share of the process-emission links to a CO2 total."""
+    shares = industry_fuel_share_mt(getattr(n, "config", None) or {}, year)
+    industry = sum(shares.values())
+    if industry <= 0 or _process_co2_mt(n) <= 0:
+        return energy
+    fraction = shares.get(fuel, 0.0) / industry
+    if fraction <= 0 or n.links.empty or not getattr(flow, "dims", ()):
+        return energy
+    links = n.links.index[
+        n.links.carrier.astype(str).str.contains("process emission", case=False)
+    ]
+    atmosphere = _atmosphere_efficiency(n)
+    # PyPSA names this dimension "name", not "Link".
+    available = flow.indexes[flow.dims[-1]]
+    for link_name in links:
+        if link_name not in available:
+            continue
+        coeff = float(atmosphere.at[link_name]) * fraction
+        if coeff == 0.0:
+            continue
+        term = (flow.loc[:, link_name] * coeff * snapshot_weight).sum()
+        energy = term if energy is None else energy + term
+    return energy
+
+
 def add_iea_combustion_co2_constraints(
     n: pypsa.Network, planning_horizons: str | None
 ) -> None:
     """
     Fix fossil combustion CO2 at the published Current Policies megatonnes.
 
-    Process emissions are left out. EU oil refining is counted in oil and in
-    neither power nor final consumption. Combined-heat-and-power CO2 is split
-    by the electrical and heat efficiencies.
+    Process emissions are split across coal, oil and gas by the industry fuel
+    shares and counted in the final rows. Refinery emissions are outside the
+    EU total and are not counted. Combined-heat-and-power CO2 is split by the
+    electrical and heat efficiencies. Agriculture machinery oil is the
+    other-energy oil residual.
     """
     spec = (getattr(n, "config", None) or {}).get("iea_co2") or {}
     if not spec.get("enable") or planning_horizons is None:
@@ -710,6 +765,16 @@ def add_iea_combustion_co2_constraints(
                 flow.loc[:, link_name] * float(coeff.at[link_name]) * snapshot_weight
             ).sum()
             energy = term if energy is None else energy + term
+        fuel_name = name[6:] if name.startswith("final_") else name
+        if fuel_name in {"coal", "oil", "gas"} and name in {
+            "coal",
+            "oil",
+            "gas",
+            "final_coal",
+            "final_oil",
+            "final_gas",
+        }:
+            energy = _add_process_co2(n, flow, snapshot_weight, year, fuel_name, energy)
         mt = reconciled.get(name, published_value(pair, year))
         n.model.add_constraints(energy == mt * 1e6 * nyears, name=f"iea_co2_{name}")
         logger.info("Combustion CO2 from %s is fixed at %.0f Mt.", name.replace("_", " "), mt)
@@ -1200,29 +1265,102 @@ def lift_hydro_inflow_to_published_energy(
     )
 
 
-def remove_agriculture_oil_outside_the_oil_rows(n: pypsa.Network) -> None:
-    """Drop agriculture oil that sits on top of the allocated oil rows.
+def _agriculture_oil_co2_mt(n: pypsa.Network) -> float:
+    """Megatonnes from the agriculture machinery oil load at the link factor."""
+    loads = _load_index(n, ["agriculture machinery oil"])
+    if len(loads) == 0 or n.links.empty:
+        return 0.0
+    energy = _load_energy_mwh(n, loads)
+    if energy <= 0:
+        return 0.0
+    links = n.links.index[n.links.carrier.astype(str).eq("agriculture machinery oil")]
+    if len(links) == 0 or "efficiency2" not in n.links.columns:
+        return 0.0
+    delivered = pd.to_numeric(n.links.loc[links, "efficiency"], errors="coerce")
+    delivered = delivered.where(delivered > 0, 1.0)
+    intensity = pd.to_numeric(n.links.loc[links, "efficiency2"], errors="coerce")
+    per_mwh = (intensity / delivered).dropna()
+    if per_mwh.empty:
+        return 0.0
+    return energy * float(per_mwh.median()) / 1e6 / _nyears(n)
 
-    Transport, buildings and industry already take the whole final-oil row.
-    The extra machinery load cannot burn inside that carbon total, so the
-    solved 2030 network shed it, about 100 TWh, at the load-shedding price.
+
+def drop_refinery_emissions(n: pypsa.Network) -> None:
+    """Leave refinery CO2 out of the EU total.
+
+    The link still moves primary oil onto the oil bus. Its carbon factor is
+    removed and the product efficiency is put back to one, so the oil is not
+    destroyed in place of an emission the EU total does not include.
     """
+    if n.links.empty:
+        return
+    links = n.links.index[n.links.carrier.astype(str).eq("oil refining")]
+    if len(links) == 0:
+        return
+    n.links.loc[links, "efficiency"] = 1.0
+    if "efficiency2" in n.links.columns:
+        n.links.loc[links, "efficiency2"] = 0.0
+    logger.info(
+        "Refinery emissions are left out of the EU total. The oil link still delivers the product."
+    )
+
+
+def _other_oil_residual_mt(config: dict, year: int) -> float | None:
+    """Published oil total left after power and final consumption."""
+    spec = config.get("iea_co2") or {}
+    if not all(spec.get(key) for key in ("oil", "power_oil", "final_oil")):
+        return None
+    return (
+        published_value(spec["oil"], year)
+        - published_value(spec["power_oil"], year)
+        - published_value(spec["final_oil"], year)
+    )
+
+
+def keep_agriculture_oil_within_other_energy(
+    n: pypsa.Network, config: dict, planning_horizons: str | None
+) -> None:
+    """Keep the agriculture oil demand inside the other-energy residual.
+
+    The load is not part of industry, buildings or transport. It is scaled
+    down only when its own carbon is larger than the residual. Refinery
+    emissions are outside the EU total and do not take any of that residual.
+    """
+    if planning_horizons is None:
+        return
     loads = _load_index(n, ["agriculture machinery oil"])
     if len(loads) == 0:
         return
-    removed = _load_energy_mwh(n, loads)
-    if removed <= 1.0:
+    energy = _load_energy_mwh(n, loads)
+    if energy <= 1.0:
         return
-    timed = n.loads_t.p_set
-    for load in loads:
-        n.loads.at[load, "p_set"] = 0.0
-        if load in timed.columns:
-            timed[load] = 0.0
+    emitted = _agriculture_oil_co2_mt(n)
+    residual = _other_oil_residual_mt(config, int(planning_horizons))
+    nyears = _nyears(n)
+    if residual is None or emitted <= residual + 0.05:
+        logger.info(
+            "Agriculture machinery oil of %.1f TWh emits %.1f Mt, inside the "
+            "other-energy oil residual%s.",
+            energy / 1e6 / nyears,
+            emitted,
+            "" if residual is None else f" of {residual:.0f} Mt",
+        )
+        return
+    if residual <= 0 or emitted <= 0:
+        logger.warning(
+            "Agriculture machinery oil of %.1f TWh has no other-energy oil residual left.",
+            energy / 1e6 / nyears,
+        )
+        return
+    target = energy * residual / emitted
+    if not _scale_loads(n, loads, target):
+        return
     logger.info(
-        "Agriculture machinery oil of %.1f TWh is removed. Transport, buildings "
-        "and industry already use the whole oil row, and the solved network "
-        "was shedding this extra demand.",
-        removed / 1e6,
+        "Agriculture machinery oil is scaled from %.1f TWh to %.1f TWh so its "
+        "carbon fits the other-energy oil residual of %.0f Mt.",
+        energy / 1e6 / nyears,
+        target / 1e6 / nyears,
+        residual,
     )
 
 
@@ -1345,9 +1483,9 @@ def _mtoe_share(spec: dict, sector: str, fuel: str, others: list[str], year: int
     return own / total
 
 
-def industry_co2_target_mt(config: dict, year: int) -> float:
+def industry_fuel_share_mt(config: dict, year: int) -> dict[str, float]:
     """
-    Industry share of the published final CO2 rows, in megatonnes.
+    Industry share of each published final CO2 row, in megatonnes.
 
     Current Policies publishes final CO2 by fuel, not a separate industry
     total. Coal and gas are split with buildings by their final-energy rows.
@@ -1356,26 +1494,30 @@ def industry_co2_target_mt(config: dict, year: int) -> float:
     """
     final = config.get("iea_final") or {}
     co2 = config.get("iea_co2") or {}
+    shares = {"coal": 0.0, "oil": 0.0, "gas": 0.0}
     if not co2:
-        return 0.0
-    coal = _mtoe_share(final, "industry", "coal", ["buildings"], year)
-    gas = _mtoe_share(final, "industry", "gas", ["buildings"], year)
-    oil_energy = _row_mtoe(final, "industry", "oil", year) + _row_mtoe(final, "buildings", "oil", year)
-    oil_share = 0.0
-    if oil_energy > 0:
-        oil_share = _row_mtoe(final, "industry", "oil", year) / oil_energy
-    total = 0.0
+        return shares
     if "final_coal" in co2:
-        total += coal * published_value(co2["final_coal"], year)
+        shares["coal"] = _mtoe_share(final, "industry", "coal", ["buildings"], year) * published_value(
+            co2["final_coal"], year
+        )
     if "final_gas" in co2:
-        total += gas * published_value(co2["final_gas"], year)
-    if "final_oil" in co2 and "transport_oil" in co2:
+        shares["gas"] = _mtoe_share(final, "industry", "gas", ["buildings"], year) * published_value(
+            co2["final_gas"], year
+        )
+    oil_energy = _row_mtoe(final, "industry", "oil", year) + _row_mtoe(final, "buildings", "oil", year)
+    if oil_energy > 0 and "final_oil" in co2 and "transport_oil" in co2:
         non_transport = published_value(co2["final_oil"], year) - published_value(co2["transport_oil"], year)
-        total += oil_share * non_transport
-    return total
+        shares["oil"] = _row_mtoe(final, "industry", "oil", year) / oil_energy * non_transport
+    return shares
 
 
-def _industry_fuel_co2_mt(n: pypsa.Network, config: dict, year: int) -> float:
+def industry_co2_target_mt(config: dict, year: int) -> float:
+    """Industry share of the published final CO2 rows, in megatonnes."""
+    return sum(industry_fuel_share_mt(config, year).values())
+
+
+def _industry_fuel_co2_by_fuel(n: pypsa.Network, config: dict, year: int) -> dict[str, float]:
     """CO2 the fixed industry coal, gas and naphtha rows emit to the atmosphere."""
     spec = config.get("iea_final") or {}
     atmosphere = _atmosphere_efficiency(n)
@@ -1384,7 +1526,7 @@ def _industry_fuel_co2_mt(n: pypsa.Network, config: dict, year: int) -> float:
         "gas": "gas for industry",
         "oil": "naphtha for industry",
     }
-    total = 0.0
+    totals = {"coal": 0.0, "oil": 0.0, "gas": 0.0}
     for fuel, carrier in carriers.items():
         mtoe = _row_mtoe(spec, "industry", fuel, year)
         links = n.links.index[n.links.carrier.astype(str).eq(carrier)] if not n.links.empty else []
@@ -1394,8 +1536,23 @@ def _industry_fuel_co2_mt(n: pypsa.Network, config: dict, year: int) -> float:
         per_mwh = (atmosphere.reindex(links) / delivered).astype(float).dropna()
         if per_mwh.empty:
             continue
-        total += mtoe * MWH_PER_MTOE * float(per_mwh.median()) / 1e6
-    return total
+        totals[fuel] = mtoe * MWH_PER_MTOE * float(per_mwh.median()) / 1e6
+    return totals
+
+
+def _industry_fuel_co2_mt(n: pypsa.Network, config: dict, year: int) -> float:
+    """CO2 the fixed industry coal, gas and naphtha rows emit to the atmosphere."""
+    return sum(_industry_fuel_co2_by_fuel(n, config, year).values())
+
+
+def process_in_industry_mt(n: pypsa.Network, year: int) -> dict[str, float]:
+    """Split process CO2 across coal, oil and gas by the industry fuel shares."""
+    shares = industry_fuel_share_mt(getattr(n, "config", None) or {}, year)
+    industry = sum(shares.values())
+    process = _process_co2_mt(n)
+    if industry <= 0 or process <= 0:
+        return {"coal": 0.0, "oil": 0.0, "gas": 0.0}
+    return {fuel: process * shares.get(fuel, 0.0) / industry for fuel in ("coal", "oil", "gas")}
 
 
 def _process_co2_mt(n: pypsa.Network) -> float:
@@ -1418,60 +1575,124 @@ def _process_co2_mt(n: pypsa.Network) -> float:
     return (from_load + feedstock) / 1e6 / _nyears(n)
 
 
-def _scale_load_values(n: pypsa.Network, loads: pd.Index, factor: float) -> None:
+def _scale_process_emissions(n: pypsa.Network, factor: float) -> None:
+    """Scale the process-CO2 load and the naphtha feedstock slice together."""
+    if factor == 1.0:
+        return
+    loads = (
+        n.loads.index[n.loads.carrier.astype(str).eq("process emissions")]
+        if not n.loads.empty
+        else pd.Index([])
+    )
     timed = n.loads_t.p_set
     for load in loads:
         if load in timed.columns and timed[load].notna().any():
-            n.loads_t.p_set[load] = timed[load].fillna(0.0) * factor
+            timed[load] = timed[load].fillna(0.0) * factor
         else:
             n.loads.at[load, "p_set"] = float(n.loads.at[load, "p_set"]) * factor
+    if n.links.empty or "efficiency2" not in n.links.columns:
+        return
+    naphtha = n.links.index[n.links.carrier.astype(str).eq("naphtha for industry")]
+    if len(naphtha):
+        n.links.loc[naphtha, "efficiency2"] = (
+            n.links.loc[naphtha, "efficiency2"].astype(float) * factor
+        )
 
 
-def scale_process_emissions_to_industry_co2(
+def _scale_atmosphere_efficiency(n: pypsa.Network, links: pd.Index, factor: float) -> None:
+    """Multiply CO2 sent to the atmosphere, and leave the delivered energy unchanged."""
+    if len(links) == 0 or factor == 1.0:
+        return
+    for column in n.links.columns:
+        if not str(column).startswith("bus") or not str(column)[3:].isdigit():
+            continue
+        port = str(column)[3:]
+        if port == "0":
+            continue
+        efficiency = "efficiency" if port == "1" else f"efficiency{port}"
+        if efficiency not in n.links.columns:
+            continue
+        on_atmosphere = n.links.loc[links, column].map(n.buses.carrier).eq("co2").fillna(False)
+        chosen = links[on_atmosphere.to_numpy()]
+        if len(chosen) == 0:
+            continue
+        n.links.loc[chosen, efficiency] = n.links.loc[chosen, efficiency].astype(float) * factor
+
+
+def match_industry_co2_including_process_emissions(
     n: pypsa.Network, config: dict, planning_horizons: str | None
 ) -> None:
     """
-    Scale process CO2 so industry fuel plus process CO2 matches the industry share.
+    Keep process CO2 and set industry fuel CO2 so the sum matches the IEA share.
 
     The fuel rows stay at the published megatonnes of oil equivalent. Process
-    emissions, including the steam-cracker slice of naphtha, take the remainder
-    of the industry share. Plastic-waste CO2 on the naphtha link stays in the
-    oil row.
+    emissions stay on their own plants. Coal, gas and naphtha combustion
+    factors are scaled by the same ratio so combustion plus process CO2 equals
+    the industry share of the final CO2 rows. Process CO2 is scaled down only
+    when it is larger than that share.
     """
     if planning_horizons is None or not (config.get("iea_co2") or {}).get("enable"):
         return
     if not (config.get("iea_final") or {}).get("enable"):
         return
     year = int(planning_horizons)
-    target = industry_co2_target_mt(config, year)
-    fuel = _industry_fuel_co2_mt(n, config, year)
-    current = _process_co2_mt(n)
-    if current <= 1e-6:
-        logger.warning("No process emissions are available to match the industry CO2 share.")
+    shares = industry_fuel_share_mt(config, year)
+    industry = sum(shares.values())
+    process = _process_co2_mt(n)
+    if industry <= 0:
         return
-    remainder = target - fuel
-    factor = 0.0 if remainder <= 0 else remainder / current
-    loads = (
-        n.loads.index[n.loads.carrier.astype(str).eq("process emissions")]
-        if not n.loads.empty
-        else pd.Index([])
-    )
-    if len(loads):
-        _scale_load_values(n, loads, factor)
-    links = (
-        n.links.index[n.links.carrier.astype(str).eq("naphtha for industry")]
-        if not n.links.empty
-        else pd.Index([])
-    )
-    if len(links) and "efficiency2" in n.links.columns:
-        n.links.loc[links, "efficiency2"] = n.links.loc[links, "efficiency2"].astype(float) * factor
+    if process > industry + 0.05:
+        _scale_process_emissions(n, industry / process)
+        process = _process_co2_mt(n)
+        logger.info(
+            "Process emissions are scaled to %.1f Mt, the industry share of final CO2.",
+            process,
+        )
+    combustion_scale = max(industry - process, 0.0) / industry
+    current = _industry_fuel_co2_by_fuel(n, config, year)
+    carriers = {
+        "coal": "coal for industry",
+        "gas": "gas for industry",
+        "oil": "naphtha for industry",
+    }
+    for fuel, share in shares.items():
+        target = share * combustion_scale
+        have = current.get(fuel, 0.0)
+        if have <= 1e-6:
+            if target > 0.05:
+                logger.warning(
+                    "No industry %s plant is available to emit %.1f Mt.", fuel, target
+                )
+            continue
+        links = n.links.index[n.links.carrier.astype(str).eq(carriers[fuel])]
+        _scale_atmosphere_efficiency(n, links, target / have)
+    emitted = _industry_fuel_co2_by_fuel(n, config, year)
     logger.info(
-        "Process emissions are scaled by %.3f. Industry fuel emits %.1f Mt and "
-        "the industry share of the final CO2 rows is %.1f Mt.",
-        factor,
-        fuel,
-        target,
+        "Process emissions of %.1f Mt stay in the industry total. Industry fuel "
+        "emits %.1f Mt: coal %.1f, oil %.1f and gas %.1f. Together that is the "
+        "%.1f Mt industry share of final CO2.",
+        _process_co2_mt(n),
+        sum(emitted.values()),
+        emitted["coal"],
+        emitted["oil"],
+        emitted["gas"],
+        industry,
     )
+
+
+def define_missing_carriers(n: pypsa.Network) -> None:
+    """Add a carrier row for every carrier the components already use."""
+    used: set[str] = set()
+    for frame in (n.buses, n.generators, n.links, n.loads, n.stores, n.storage_units):
+        if frame.empty or "carrier" not in frame.columns:
+            continue
+        used.update(frame["carrier"].dropna().astype(str))
+    used.discard("")
+    missing = sorted(used - set(map(str, n.carriers.index)))
+    if not missing:
+        return
+    n.add("Carrier", missing)
+    logger.info("Defined %d carriers used by the components.", len(missing))
 
 
 def prepare_iea_cps(
@@ -1483,9 +1704,11 @@ def prepare_iea_cps(
     add_coal_boilers(n, config)
     add_other_energy_sector(n, config, planning_horizons)
     scale_iea_final_loads(n, config, planning_horizons)
-    scale_process_emissions_to_industry_co2(n, config, planning_horizons)
-    remove_agriculture_oil_outside_the_oil_rows(n)
+    match_industry_co2_including_process_emissions(n, config, planning_horizons)
+    drop_refinery_emissions(n)
+    keep_agriculture_oil_within_other_energy(n, config, planning_horizons)
     raise_solid_biomass_ceiling(n, config, planning_horizons)
     lift_geothermal_if_energy_exceeds_capacity(n, config, planning_horizons)
     lift_weather_limited_generation(n, config, planning_horizons)
     lift_hydro_inflow_to_published_energy(n, config, planning_horizons)
+    define_missing_carriers(n)

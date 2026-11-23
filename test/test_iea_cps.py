@@ -157,6 +157,15 @@ def test_capacity_file_matches_eu_cps_totals():
     assert abs(totals.loc["hydro", "2040"] - 168) < 0.05
     assert abs(totals.loc["biomass", "2030"] - 56) < 0.05
     assert abs(totals.loc["biomass", "2040"] - 59) < 0.05
+    assert abs(totals.loc["onwind", "2018"] + totals.loc["offwind-all", "2018"] - 180) < 0.05
+    assert abs(totals.loc["solar-all", "2018"] - 117) < 0.05
+    assert abs(totals.loc["gas", "2018"] - 217) < 0.05
+    assert abs(totals.loc["coal-all", "2018"] - 164) < 0.05
+    assert abs(totals.loc["oil", "2018"] - 45) < 0.05
+    assert abs(totals.loc["nuclear", "2018"] - 125) < 0.05
+    assert abs(totals.loc["hydro", "2018"] - 155) < 0.05
+    assert abs(totals.loc["biomass", "2018"] - 48) < 0.05
+    assert abs(totals.loc["geothermal", "2018"] - 1) < 0.05
     # Every technology is fixed at the CPS total, including coal and oil.
     assert table.loc[("DE", "coal-all"), ("2030", "min")] == table.loc[
         ("DE", "coal-all"), ("2030", "max")
@@ -350,6 +359,12 @@ def test_cps_config_disables_the_europe_wide_co2_cap():
         config = yaml.safe_load(file)
     assert config["foresight"] == "myopic"
     assert config["planning_horizons"] == [2030, 2035, 2040]
+    assert config["run"]["name"] == "iea-cps"
+    with open(ROOT / "config" / "config.historic.yaml") as historic_file:
+        historic = yaml.safe_load(historic_file)
+    assert historic["run"]["name"] == "iea-historic"
+    assert historic["planning_horizons"] == [2018]
+    assert historic["run"]["shared_resources"]["policy"] == "iea-cps"
     assert all(value is None for value in config["co2_budget"]["upper"].values())
     assert config["co2_budget_national"]["enable"] is False
     assert config["iea_co2"]["enable"] is True
@@ -363,6 +378,9 @@ def test_cps_config_disables_the_europe_wide_co2_cap():
     assert config["iea_generation"]["enable"] is True
     assert config["iea_generation"]["coal"][2030] == 479
     assert config["iea_generation"]["geothermal"][2030] == 9
+    assert config["iea_generation"]["nuclear"][2018] == 829
+    assert config["iea_co2"]["coal"][2018] == 874
+    assert config["costs"]["emission_prices"]["co2"][2018] == pytest.approx(20 / 1.1810, abs=0.02)
     assert config["electricity"]["nuclear_fleet"] is True
     assert set(config["countries"]) == {
         "AT", "BE", "BG", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GB",
@@ -372,6 +390,109 @@ def test_cps_config_disables_the_europe_wide_co2_cap():
     assert config["solving"]["constraints"]["CCL"] is True
     assert config["sector"]["co2_sequestration_potential"][2050] == 0
     assert config["sector"]["conventional_generation"]["coal"] == "coal"
+
+
+def test_2018_follows_the_weo_2019_historical_column():
+    """2018 is the published historical column, not a backcast from 2030."""
+    from scripts.iea_cps_constraints import industry_fuel_share_mt, published_value
+
+    with open(ROOT / "config" / "config.yaml") as file:
+        config = yaml.safe_load(file)
+    generation = {
+        "coal": 666,
+        "oil": 58,
+        "gas": 629,
+        "nuclear": 829,
+        "hydro": 339,
+        "biomass": 225,
+        "wind": 392,
+        "solar": 129,
+        "geothermal": 7,
+    }
+    for name, twh in generation.items():
+        assert published_value(config["iea_generation"][name], 2018) == twh
+    # Solar in 2018 is 124 TWh of PV plus 5 TWh of CSP.
+    assert published_value(config["iea_must_run"]["csp"]["twh"], 2018) == 5
+    assert published_value(config["iea_must_run"]["csp"]["gw"], 2018) == 2
+    assert published_value(config["iea_must_run"]["marine"]["gw"], 2018) == 0
+    assert published_value(config["iea_must_run"]["marine"]["twh"], 2018) == 1
+    co2 = {
+        "coal": 874,
+        "oil": 1332,
+        "gas": 878,
+        "power_coal": 694,
+        "power_oil": 49,
+        "power_gas": 280,
+        "final_coal": 147,
+        "final_oil": 1197,
+        "final_gas": 559,
+        "transport_oil": 919,
+    }
+    for name, mt in co2.items():
+        assert published_value(config["iea_co2"][name], 2018) == mt
+    assert 694 + 49 + 280 == 1023
+    final = {
+        ("industry", "coal"): 21,
+        ("industry", "oil"): 27,
+        ("industry", "gas"): 88,
+        ("industry", "electricity"): 89,
+        ("transport", "oil"): 302,
+        ("transport", "electricity"): 6,
+        ("transport", "biofuels"): 17,
+        ("buildings", "coal"): 10,
+        ("buildings", "oil"): 50,
+        ("buildings", "gas"): 149,
+        ("buildings", "electricity"): 142,
+    }
+    for (sector, fuel), mtoe in final.items():
+        assert published_value(config["iea_final"][sector][fuel], 2018) == mtoe
+    assert config["iea_primary_check"]["oil_mbd"][2018] == 11.1
+    assert config["iea_primary_check"]["gas_bcm"][2018] == 480
+    assert config["iea_primary_check"]["coal_mtce"][2018] == 319
+    # 2035 stays the geometric midpoint of 2030 and 2040.
+    coal = config["iea_co2"]["coal"]
+    assert published_value(coal, 2035) == pytest.approx(637 * (424 / 637) ** 0.5)
+    assert published_value(coal, 2018) != pytest.approx(637 * (424 / 637) ** (-12 / 10))
+    shares = industry_fuel_share_mt(config, 2018)
+    assert shares["coal"] == pytest.approx(21 / (21 + 10) * 147)
+    assert shares["oil"] == pytest.approx(27 / (27 + 50) * (1197 - 919))
+    assert shares["gas"] == pytest.approx(88 / (88 + 149) * 559)
+    electric = 6 * 53.19
+    combustion = (302 + 17 + 3) * 16.0712
+    share = electric / (electric + combustion)
+    assert config["sector"]["land_transport_electric_share"][2018] == pytest.approx(share, abs=5e-5)
+    assert config["sector"]["land_transport_ice_share"][2018] == pytest.approx(1 - share, abs=5e-5)
+    prices = pd.read_csv(ROOT / "data" / "iea_cps_fuel_prices.csv")
+    prices = prices[prices.planning_horizon.eq(2018)].set_index("technology").value
+    usd_per_eur = 1.1810
+    assert prices["gas"] == pytest.approx(7.6 / usd_per_eur / 0.293071, abs=0.01)
+    assert prices["coal"] == pytest.approx(92 / usd_per_eur / (6000 * 4.1868 / 3600), abs=0.01)
+    assert prices["oil"] == pytest.approx(68 / usd_per_eur / ((41.868 / 3.6) / 7.33), abs=0.01)
+
+
+def test_marine_2018_installs_the_energy_when_capacity_prints_as_zero(tmp_path):
+    from scripts.iea_cps_constraints import add_csp_and_marine
+
+    path = _limit_file(
+        tmp_path / "limits.csv",
+        [("DE", "solar-all", 1000.0, 1000.0)],
+        year="2018",
+    )
+    n = pypsa.Network()
+    n.add("Bus", "DE", carrier="AC", country="DE")
+    add_csp_and_marine(
+        n,
+        {
+            "iea_must_run": {
+                "enable": True,
+                "marine": {"gw": {2018: 0, 2030: 1}, "twh": {2018: 1, 2030: 2}},
+            },
+            "solving": {"agg_p_nom_limits": {"file": path.as_posix()}},
+        },
+        "2018",
+    )
+    assert n.generators.p_nom.sum() == pytest.approx(1000.0 / 8.76)
+    assert float(n.generators.p_min_pu.iloc[0]) == 1.0
 
 
 def _limit_file(path, rows, year="2030"):
@@ -552,13 +673,14 @@ def test_oil_co2_follows_the_fuel_the_plants_actually_burn():
     assert targets["transport_oil"] == pytest.approx(299 * (41.868e6 / 3.6) * 0.2571 / 1e6, rel=1e-3)
 
 
-def test_process_emissions_fill_the_industry_share_of_final_co2():
+def test_industry_fuel_plus_process_emissions_meet_the_share():
     from scripts.iea_cps_constraints import (
         MWH_PER_MTOE,
         _industry_fuel_co2_mt,
         _process_co2_mt,
         industry_co2_target_mt,
-        scale_process_emissions_to_industry_co2,
+        match_industry_co2_including_process_emissions,
+        process_in_industry_mt,
     )
 
     config = {
@@ -590,17 +712,24 @@ def test_process_emissions_fill_the_industry_share_of_final_co2():
     n.add("Link", "coal", bus0="EU coal", bus1="industry", bus2="co2 atmosphere", carrier="coal for industry", efficiency=1.0, efficiency2=0.3361)
     n.add("Link", "gas", bus0="EU gas", bus1="industry", bus2="co2 atmosphere", carrier="gas for industry", efficiency=1.0, efficiency2=0.198)
     n.add("Link", "naphtha", bus0="EU oil", bus1="industry", bus2="process", bus3="co2 atmosphere", carrier="naphtha for industry", efficiency=1.0, efficiency2=0.02, efficiency3=0.2365)
+    n.add("Link", "process", bus0="process", bus1="co2 atmosphere", carrier="process emissions", efficiency=1.0, p_nom=50.0, p_nom_extendable=True)
     hours = float(n.snapshot_weightings.generators.sum())
     n.add("Load", "naphtha for industry", bus="industry", carrier="naphtha for industry", p_set=26 * MWH_PER_MTOE / hours)
     n.add("Load", "process emissions", bus="process", carrier="process emissions", p_set=-80e6 / hours)
-    before = float(n.links.at["naphtha", "efficiency3"])
-    scale_process_emissions_to_industry_co2(n, config, "2030")
-    fuel = _industry_fuel_co2_mt(n, config, 2030)
+    match_industry_co2_including_process_emissions(n, config, "2030")
     process = _process_co2_mt(n)
-    assert fuel + process == pytest.approx(industry_co2_target_mt(config, 2030), abs=0.05)
-    assert process < 80
-    assert float(n.links.at["naphtha", "efficiency3"]) == before
-    assert float(n.links.at["naphtha", "efficiency2"]) < 0.02
+    assert process > 1.0
+    assert float(n.loads.at["process emissions", "p_set"]) < 0.0
+    assert float(n.links.at["naphtha", "efficiency"]) == 1.0
+    assert float(n.links.at["naphtha", "efficiency2"]) == pytest.approx(0.02)
+    assert float(n.links.at["process", "p_nom"]) == 50.0
+    assert bool(n.links.at["process", "p_nom_extendable"])
+    assert _industry_fuel_co2_mt(n, config, 2030) + process == pytest.approx(
+        industry_co2_target_mt(config, 2030), abs=0.05
+    )
+    n.config = config
+    assert sum(process_in_industry_mt(n, 2030).values()) == pytest.approx(process, abs=0.05)
+    assert float(n.links.at["coal", "efficiency"]) == 1.0
 
 
 def test_csp_is_must_run_without_cost(tmp_path):
@@ -644,6 +773,7 @@ def test_combustion_co2_uses_published_tonnes_and_skips_process():
         bus2="co2 atmosphere",
         carrier="OCGT",
         p_nom_extendable=True,
+        marginal_cost=1.0,
         efficiency=0.5,
         efficiency2=1.0,
     )
@@ -702,6 +832,57 @@ def test_combustion_co2_uses_published_tonnes_and_skips_process():
     oil_names = set(labels[labels.isin(oil_vars)].index.get_level_values("Link"))
     assert oil_names == {"EU oil refining"}
     assert "iea_co2_process" not in n.model.constraints
+
+
+def test_process_link_is_counted_in_the_fuel_co2_rows():
+    pytest.importorskip("pandera")
+    from scripts.iea_cps_constraints import add_iea_combustion_co2_constraints
+
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.add(
+        "Bus",
+        ["oil", "naphtha", "co2", "process", "coal", "industry"],
+        carrier=["oil", "naphtha for industry", "co2", "process emissions", "coal", "industry"],
+    )
+    n.add("Link", "naphtha", bus0="oil", bus1="naphtha", bus2="process", bus3="co2", carrier="naphtha for industry", efficiency=1.0, efficiency2=0.02, efficiency3=0.2, p_nom_extendable=True, marginal_cost=1.0)
+    n.add("Link", "coal", bus0="coal", bus1="industry", bus2="co2", carrier="coal for industry", efficiency=1.0, efficiency2=0.3, p_nom_extendable=True, marginal_cost=1.0)
+    n.add("Link", "process", bus0="process", bus1="co2", carrier="process emissions", efficiency=1.0, p_nom_extendable=True, marginal_cost=1.0)
+    n.add("Generator", "oil supply", bus="oil", carrier="oil", p_nom=1.0e6, marginal_cost=1.0)
+    n.add("Generator", "coal supply", bus="coal", carrier="coal", p_nom=1.0e6, marginal_cost=1.0)
+    n.add("Load", "naphtha", bus="naphtha", carrier="naphtha for industry", p_set=10.0)
+    n.add("Load", "coal load", bus="industry", carrier="coal for industry", p_set=10.0)
+    n.add("Load", "process emissions", bus="process", carrier="process emissions", p_set=-5.0)
+    pair = {2030: 100, 2040: 80}
+    n.config = {
+        "iea_co2": {
+            "enable": True,
+            **{key: dict(pair) for key in (
+                "coal", "oil", "gas", "power_coal", "power_oil", "power_gas",
+                "final_coal", "final_oil", "final_gas",
+            )},
+            "transport_oil": {2030: 40, 2040: 30},
+        },
+        "iea_final": {
+            "enable": True,
+            "industry": {"coal": {2030: 20, 2040: 18}, "oil": {2030: 26, 2040: 24}, "gas": {2030: 10, 2040: 8}},
+            "buildings": {"coal": {2030: 6, 2040: 3}, "oil": {2030: 10, 2040: 8}, "gas": {2030: 10, 2040: 8}},
+            "transport": {"oil": {2030: 10, 2040: 8}},
+        },
+    }
+    n.optimize.create_model()
+    add_iea_combustion_co2_constraints(n, "2030")
+    labels = n.model.variables["Link-p"].labels.to_series()
+
+    def linked(constraint):
+        variables = set(n.model.constraints[constraint].data.vars.values)
+        chosen = labels[labels.isin(variables)]
+        return set(chosen.index.get_level_values(-1))
+
+    assert "process" in linked("iea_co2_oil")
+    assert "process" in linked("iea_co2_final_oil")
+    assert "process" in linked("iea_co2_coal")
+    assert "process" in linked("iea_co2_final_coal")
 
 
 def test_final_electricity_load_is_scaled_to_the_cps_mtoe():
@@ -1015,15 +1196,110 @@ def test_geothermal_capacity_is_raised_when_energy_exceeds_the_gigawatts(tmp_pat
     assert short.generators.at["DE geo", "p_nom"] > required_2040
 
 
-def test_agriculture_oil_outside_the_allocated_rows_is_removed():
-    from scripts.iea_cps_constraints import remove_agriculture_oil_outside_the_oil_rows
+def test_agriculture_oil_stays_inside_the_other_energy_residual():
+    from scripts.iea_cps_constraints import (
+        _co2_weights,
+        keep_agriculture_oil_within_other_energy,
+    )
+
+    config = {
+        "iea_co2": {
+            "oil": {2030: 1132, 2040: 975},
+            "power_oil": {2030: 19, 2040: 13},
+            "final_oil": {2030: 1047, 2040: 900},
+        }
+    }
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
+    n.snapshot_weightings.loc[:, :] = 4380.0
+    hours = float(n.snapshot_weightings.generators.sum())
+    n.add(
+        "Bus",
+        ["EU oil", "DE agriculture machinery oil", "co2 atmosphere"],
+        carrier=["oil", "agriculture machinery oil", "co2"],
+    )
+    n.add(
+        "Link",
+        "DE agriculture machinery oil",
+        bus0="EU oil",
+        bus1="DE agriculture machinery oil",
+        bus2="co2 atmosphere",
+        carrier="agriculture machinery oil",
+        efficiency=1.0,
+        efficiency2=0.25,
+        p_nom_extendable=True,
+    )
+    n.add(
+        "Load",
+        "DE agriculture oil",
+        bus="DE agriculture machinery oil",
+        carrier="agriculture machinery oil",
+        p_set=10e6 / hours,
+    )
+    keep_agriculture_oil_within_other_energy(n, config, "2030")
+    assert n.loads.at["DE agriculture oil", "p_set"] == pytest.approx(10e6 / hours)
+    weights = _co2_weights(n)
+    assert weights.at["DE agriculture machinery oil", "other"] == 1.0
+    assert weights.at["DE agriculture machinery oil", "final"] == 0.0
+
+    n.links.at["DE agriculture machinery oil", "efficiency2"] = 10.0
+    keep_agriculture_oil_within_other_energy(n, config, "2030")
+    # 10 TWh at 10 t/MWh is 100 Mt. The residual is 1132 - 19 - 1047 = 66 Mt.
+    assert n.loads.at["DE agriculture oil", "p_set"] == pytest.approx(10e6 / hours * 0.66)
+
+
+def test_refinery_emissions_are_outside_the_eu_total_and_agriculture_stays():
+    from scripts.iea_cps_constraints import (
+        _co2_weights,
+        drop_refinery_emissions,
+        keep_agriculture_oil_within_other_energy,
+    )
 
     n = pypsa.Network()
     n.set_snapshots(pd.date_range("2030-01-01", periods=2, freq="h"))
-    n.add("Bus", "oil", carrier="agriculture machinery oil")
-    n.add("Load", "DE agriculture oil", bus="oil", carrier="agriculture machinery oil", p_set=5.0)
-    remove_agriculture_oil_outside_the_oil_rows(n)
-    assert n.loads.at["DE agriculture oil", "p_set"] == 0.0
+    n.snapshot_weightings.loc[:, :] = 4380.0
+    hours = float(n.snapshot_weightings.generators.sum())
+    n.add(
+        "Bus",
+        ["primary", "EU oil", "agri", "co2 atmosphere"],
+        carrier=["oil primary", "oil", "agriculture machinery oil", "co2"],
+    )
+    n.add(
+        "Link",
+        "EU oil refining",
+        bus0="primary",
+        bus1="EU oil",
+        bus2="co2 atmosphere",
+        carrier="oil refining",
+        efficiency=0.95,
+        efficiency2=0.02,
+        p_nom=1.0e6,
+    )
+    n.add(
+        "Link",
+        "agri",
+        bus0="EU oil",
+        bus1="agri",
+        bus2="co2 atmosphere",
+        carrier="agriculture machinery oil",
+        efficiency=1.0,
+        efficiency2=0.25,
+        p_nom_extendable=True,
+    )
+    n.add("Load", "agri", bus="agri", carrier="agriculture machinery oil", p_set=20e6 / hours)
+    config = {
+        "iea_co2": {
+            "oil": {2030: 1132, 2040: 975},
+            "power_oil": {2030: 19, 2040: 13},
+            "final_oil": {2030: 1047, 2040: 900},
+        }
+    }
+    drop_refinery_emissions(n)
+    keep_agriculture_oil_within_other_energy(n, config, "2030")
+    assert n.links.at["EU oil refining", "efficiency"] == 1.0
+    assert n.links.at["EU oil refining", "efficiency2"] == 0.0
+    assert n.loads.at["agri", "p_set"] == pytest.approx(20e6 / hours)
+    assert _co2_weights(n).empty or "EU oil refining" not in _co2_weights(n).index
 
 
 def test_solid_biomass_ceiling_covers_electricity_fuel():
@@ -1146,3 +1422,52 @@ def test_primary_oil_check_uses_barrels_per_toe():
 
     mtoe = 9.6 * 365.25 / 7.33
     assert MBD_TO_MWH * 9.6 / MWH_PER_MTOE == pytest.approx(mtoe)
+
+
+def test_baseline_abatement_ratio_matches_the_cost_and_co2_difference(tmp_path, caplog):
+    """cost 130 against 100 and CO2 40 against 50 is 3 EUR/t. 2018 is not drawn."""
+    import logging
+
+    from postprocessing.baseline_abatement import (
+        BASELINE_YEAR,
+        build_project_table,
+        eur_per_tonne,
+        group_carriers,
+        group_columns,
+        plot_baseline_abatement,
+    )
+
+    assert eur_per_tonne(130, 100, 50, 40) == pytest.approx(3)
+
+    baseline = group_carriers(pd.Series({"onwind": 40.0, "OCGT": 60.0}))
+    year = group_carriers(pd.Series({"onwind": 100.0, "coal": 30.0}))
+    assert baseline.sum() == pytest.approx(100)
+    assert year.sum() == pytest.approx(130)
+
+    caplog.set_level(logging.WARNING)
+    table = build_project_table(
+        {
+            2018: baseline,
+            2030: year,
+            2035: group_carriers(pd.Series({"onwind": 10.0})),
+        },
+        {2018: 50.0, 2030: 40.0, 2035: 50.0},
+    )
+    assert table["year"].tolist() == [2030]
+    assert BASELINE_YEAR not in set(table["year"])
+    assert table.loc[0, "eur_per_t"] == pytest.approx(3)
+    assert table.loc[0, "emission_change"] == pytest.approx(40 - 50)
+    assert table.loc[0, "cost_change"] == pytest.approx(30)
+    changes = table.loc[0, group_columns(table)]
+    assert changes.sum() == pytest.approx(table.loc[0, "cost_change"])
+    assert changes.sum() == pytest.approx(130 - 100)
+    assert "2035 has the same CO2 as 2018" in caplog.text
+
+    injected = pd.concat(
+        [table, table.assign(year=BASELINE_YEAR)],
+        ignore_index=True,
+    )
+    plotted = plot_baseline_abatement(injected, tmp_path / "baseline_abatement.png")
+    assert plotted == [2030]
+    assert BASELINE_YEAR not in plotted
+    assert (tmp_path / "baseline_abatement.png").stat().st_size > 0

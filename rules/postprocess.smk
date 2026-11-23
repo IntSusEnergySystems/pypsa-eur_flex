@@ -3,12 +3,19 @@
 # SPDX-License-Identifier: MIT
 
 def all_solved_networks(wildcards):
-    """Every solved horizon. Post-processing waits until the last year is finished."""
-    return expand(
+    """Every solved horizon. Post-processing waits until the last year is finished.
+
+    Current Policies starts in 2030. The 2018 historic solve is the baseline
+    placed in front of those years.
+    """
+    paths = expand(
         RESULTS + "networks/solved_{horizon}.nc",
         horizon=config["planning_horizons"],
         run=config["run"]["name"],
     )
+    if config["run"]["name"] == "iea-cps" and 2018 not in config["planning_horizons"]:
+        paths = ["results/iea-historic/networks/solved_2018.nc", *paths]
+    return paths
 
 
 if config["foresight"] != "perfect":
@@ -419,19 +426,17 @@ rule iea_comparison:
         workflow.source_path("../postprocessing/postprocess_iea_cps.py")
 
 
-rule iea_abatement:
-    """Plots the EU CO2 price, emissions and system-cost curve from the solved years."""
+rule iea_baseline_abatement:
+    """Plots EU abatement cost and emission change of each solved year against 2018."""
     input:
         networks=all_solved_networks,
-        comparison=RESULTS + "iea_comparison/eu_comparison.csv",
     output:
-        summary=RESULTS + "iea_comparison/abatement_summary.csv",
-        costs=RESULTS + "iea_comparison/abatement_costs.csv",
-        curve=RESULTS + "iea_comparison/abatement_curve.png",
+        png=RESULTS + "iea_comparison/baseline_abatement.png",
+        csv=RESULTS + "iea_comparison/baseline_abatement.csv",
     log:
-        RESULTS + "logs/iea_abatement.log",
+        RESULTS + "logs/iea_baseline_abatement.log",
     threads: 2
     resources:
         mem_mb=20000,
     script:
-        workflow.source_path("../postprocessing/abatement_curve.py")
+        workflow.source_path("../postprocessing/baseline_abatement.py")

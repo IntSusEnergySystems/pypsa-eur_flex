@@ -626,7 +626,7 @@ def attach_conventional_generators(
     if ppl.empty:
         return
 
-    carriers = list(
+    carriers = sorted(
         set(conventional_carriers)
         | set(extendable_carriers["Generator"]) - set(renewable_carriers)
     )
@@ -634,7 +634,7 @@ def attach_conventional_generators(
     ppl = ppl.query("carrier in @carriers").copy()
 
     # reduce carriers to those in power plant dataset
-    carriers = list(set(carriers) & set(ppl.carrier.unique()))
+    carriers = sorted(set(carriers) & set(ppl.carrier.unique()))
     add_missing_carriers(n, carriers)
     add_co2_emissions(n, costs, carriers)
 
@@ -1263,7 +1263,9 @@ def main(
         params.links["length_factor"],
     )
 
-    renewable_carriers = set(params.electricity["renewable_carriers"])
+    # A set would add wind and solar in hash order, which changes between
+    # processes and is enough to make the barrier fail on this model.
+    renewable_carriers = list(dict.fromkeys(params.electricity["renewable_carriers"]))
     extendable_carriers = params.electricity["extendable_carriers"]
     conventional_carriers = params.electricity["conventional_carriers"]
     if params.sector["enabled"]:

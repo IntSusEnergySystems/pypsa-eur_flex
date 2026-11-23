@@ -1,0 +1,14 @@
+# IEA WEO 2019 historical column, one planning year.
+#
+# Load this after config/config.yaml:
+#   snakemake --configfile config/config.historic.yaml -- results/iea-historic/networks/solved_2018.nc
+#
+# The prepared networks stay in resources/iea-cps. The solved 2018 network
+# is results/iea-historic and is not the brownfield start of Current Policies.
+run:
+  name: iea-historic
+  shared_resources:
+    policy: iea-cps
+
+planning_horizons:
+- 2018

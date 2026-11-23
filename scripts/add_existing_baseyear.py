@@ -833,7 +833,7 @@ def main(
 ) -> None:
     logger.info("Adding existing capacities")
     baseyear = params.horizons[0]
-    renewable_carriers = set(params.renewable_carriers)
+    renewable_carriers = list(dict.fromkeys(params.renewable_carriers))
 
     options = params.sector
 

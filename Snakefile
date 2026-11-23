@@ -170,7 +170,7 @@ rule all:
         expand(
             [
                 RESULTS + "iea_comparison/eu_comparison.csv",
-                RESULTS + "iea_comparison/abatement_curve.png",
+                RESULTS + "iea_comparison/baseline_abatement.png",
             ],
             run=config["run"]["name"],
         ),

@@ -29,6 +29,7 @@ from scripts.iea_cps_constraints import (
     MBD_TO_MWH,
     MTCE_TO_MWH,
     MWH_PER_MTOE,
+    _atmosphere_efficiency,
     _building_links,
     _co2_weights,
     _load_energy_mwh,
@@ -36,6 +37,7 @@ from scripts.iea_cps_constraints import (
     _nyears,
     _row_mtoe,
     fossil_primary_mwh,
+    industry_fuel_share_mt,
     published_value,
 )
 from scripts.solve_network import _ccl_horizon_block, _ccl_rename
@@ -218,8 +220,44 @@ def _published_capacity_gw(config: dict, year: int) -> dict[str, float]:
     return published
 
 
-def co2_mt(n: pypsa.Network) -> dict[str, float]:
-    """Combustion CO2 by the same split as the optimisation."""
+def _add_process_mt(
+    n: pypsa.Network,
+    totals: dict[str, float],
+    year: int,
+    weight: pd.Series,
+    nyears: float,
+) -> None:
+    """Add solved process CO2 onto the fuel rows in the industry-share split."""
+    if n.links.empty or n.links_t.p0.empty or nyears <= 0:
+        return
+    links = n.links.index[
+        n.links.carrier.astype(str).str.contains("process emission", case=False)
+    ].intersection(n.links_t.p0.columns)
+    if len(links) == 0:
+        return
+    atmosphere = _atmosphere_efficiency(n)
+    tonnes = sum(
+        _annual_mwh(n.links_t.p0[unit], weight) * float(atmosphere.at[unit])
+        for unit in links
+    )
+    if tonnes <= 0:
+        return
+    shares = industry_fuel_share_mt(getattr(n, "config", None) or {}, year)
+    industry = sum(shares.values())
+    if industry <= 0:
+        return
+    for fuel, share in shares.items():
+        part = tonnes * share / industry / 1e6 / nyears
+        totals[fuel] = totals.get(fuel, 0.0) + part
+        totals[f"final {fuel}"] = totals.get(f"final {fuel}", 0.0) + part
+
+
+def co2_mt(n: pypsa.Network, year: int | None = None) -> dict[str, float]:
+    """Combustion CO2 by the same split as the optimisation.
+
+    Process emissions are added to each fuel in proportion to the industry
+    share, which is how the optimisation counts them.
+    """
     weights = _co2_weights(n)
     if weights.empty or n.links_t.p0.empty:
         return {}
@@ -242,6 +280,8 @@ def co2_mt(n: pypsa.Network) -> dict[str, float]:
                 coeff *= float(weights.at[unit, column])
             tonnes += _annual_mwh(n.links_t.p0[unit], weight) * coeff
         totals[label] = tonnes / 1e6 / nyears
+    if year is not None:
+        _add_process_mt(n, totals, year, weight, nyears)
     for fuel in ("coal", "oil", "gas"):
         chosen = weights.index[weights["fuel"].eq(fuel) & (weights["other"] > 0)]
         tonnes = 0.0
@@ -330,7 +370,7 @@ def compare_network(n: pypsa.Network, config: dict, year: int) -> pd.DataFrame:
             note = "Run-of-river plus reservoirs. Pumped storage is excluded."
         rows.append(_row("capacity", name, "GW", year, have.get(name, 0.0), target, note))
     co2_spec = config.get("iea_co2") or {}
-    emitted = co2_mt(n)
+    emitted = co2_mt(n, year)
     if co2_spec.get("enable"):
         for label, key in (
             ("coal", "coal"),
@@ -603,7 +643,7 @@ def plot_category(frame: pd.DataFrame, category: str, path: Path) -> None:
     axes[0].set_yticks(positions, names)
     axes[0].invert_yaxis()
     axes[-1].legend(frameon=False, loc="lower right")
-    fig.suptitle(f"{category} against the original WEO 2019 Current Policies values")
+    fig.suptitle(f"{category} against WEO 2019, with 2018 the historical column")
     fig.savefig(path, dpi=160)
     plt.close(fig)
 
@@ -641,7 +681,7 @@ def plot_primary(frame: pd.DataFrame, path: Path) -> None:
         ax.set_title(str(name))
         _style_axis(ax)
     axes[-1].legend(frameon=False)
-    fig.suptitle("Primary fuel against the original Current Policies totals")
+    fig.suptitle("Primary fuel against WEO 2019, with 2018 the historical column")
     fig.savefig(path, dpi=160)
     plt.close(fig)
 
@@ -655,7 +695,7 @@ def plot_costs(frame: pd.DataFrame, path: Path) -> None:
     carriers = frame.loc[frame.category.eq("cost carrier")]
     if totals.empty and carriers.empty:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.2), constrained_layout=True)
     if not totals.empty:
         years = [int(year) for year in sorted(totals.year.unique())]
         positions = list(range(len(years)))
@@ -761,7 +801,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("results/iea-cps/iea_comparison"))
     args = parser.parse_args()
     networks = args.networks or [
-        Path(f"results/iea-cps/networks/solved_{year}.nc") for year in (2030, 2035, 2040)
+        Path(f"results/iea-cps/networks/solved_{year}.nc")
+        for year in (2018, 2030, 2035, 2040)
     ]
     missing = [path for path in networks if not path.exists()]
     if missing:

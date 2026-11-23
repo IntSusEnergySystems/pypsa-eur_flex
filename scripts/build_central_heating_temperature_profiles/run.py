@@ -140,18 +140,18 @@ def scale_temperature_to_investment_year(
     -------
     dict
         A dictionary with the temperature for each country in the investment year.
+        A planning year before the reference year keeps the reference temperatures.
 
     Raises
     ------
     ValueError
-        If the investment year is before the current year.
         If the relative annual temperature reduction is not between 0 and 1.
     """
 
     if investment_year < current_year:
-        raise ValueError(
-            f"Error: Investment year {investment_year} is before current year {current_year}."
-        )
+        # The reduction is applied forward from the reference year. Earlier
+        # planning years keep those reference temperatures.
+        investment_year = current_year
     if (
         relative_annual_temperature_reduction < 0
         or relative_annual_temperature_reduction > 1

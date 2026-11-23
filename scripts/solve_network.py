@@ -1610,9 +1610,12 @@ def add_iea_generation_constraints(
     """
     Fix annual electricity output at the WEO 2019 Current Policies totals.
 
-    Values are EU electrical TWh. 2035, 2045 and 2050 keep the 2030-2040
+    Values are EU electrical TWh. A year written in the table, including
+    2018, is used as published. 2035, 2045 and 2050 keep the 2030-2040
     ratio. Link output is ``p`` times electrical efficiency.
     """
+    from scripts.iea_cps_constraints import published_value
+
     spec = n.config.get("iea_generation") or {}
     if not spec.get("enable") or planning_horizons is None:
         return
@@ -1649,10 +1652,7 @@ def add_iea_generation_constraints(
         pair = spec.get(name)
         if not pair or name in skipped:
             continue
-        published = {}
-        for key in (2030, 2040):
-            published[key] = pair[key] if key in pair else pair[str(key)]
-        twh = _iea_extend(float(published[2030]), float(published[2040]))[year]
+        twh = published_value(pair, year)
         target = twh * 1e6 * nyears
         terms = []
         if kind in {"Generator", "both"} and "Generator-p" in n.model.variables:

@@ -439,6 +439,59 @@ def cap_transmission_capacity(
         n.links["p_nom_max"] = n.links.p_nom_max.clip(upper=link_max)
 
 
+def keep_operating_interconnectors(n: pypsa.Network, horizon: int) -> None:
+    """Keep only interconnectors already operating, and do not expand them.
+
+    AC line ratings and DC link ratings stay at the capacity in service in
+    ``horizon``. A branch whose build year is later than that is left out.
+    A build year of 0 is an existing circuit whose year was not recorded.
+    """
+    horizon = int(horizon)
+    if not n.lines.empty and "build_year" in n.lines.columns:
+        year = pd.to_numeric(n.lines["build_year"], errors="coerce").fillna(0)
+        future = n.lines.index[year > horizon]
+        if len(future):
+            n.remove("Line", future)
+            logger.info(
+                "Removed %d AC interconnectors that are not operating in %s.",
+                len(future),
+                horizon,
+            )
+    if not n.lines.empty:
+        n.lines["s_nom_extendable"] = False
+        n.lines["s_nom_min"] = n.lines["s_nom"]
+        if "s_nom_max" in n.lines.columns:
+            n.lines["s_nom_max"] = n.lines["s_nom"]
+        logger.info(
+            "AC interconnection is fixed at the operating capacity. Expansion is off."
+        )
+
+    if n.links.empty or "carrier" not in n.links.columns:
+        return
+    direct_current = n.links["carrier"].astype(str).eq("DC")
+    if direct_current.any() and "build_year" in n.links.columns:
+        year = pd.to_numeric(n.links["build_year"], errors="coerce").fillna(0)
+        future = n.links.index[direct_current & (year > horizon)]
+        if len(future):
+            n.remove("Link", future)
+            logger.info(
+                "Removed %d DC interconnectors that are not operating in %s.",
+                len(future),
+                horizon,
+            )
+    direct_current = n.links["carrier"].astype(str).eq("DC")
+    if direct_current.any():
+        n.links.loc[direct_current, "p_nom_extendable"] = False
+        n.links.loc[direct_current, "p_nom_min"] = n.links.loc[direct_current, "p_nom"]
+        if "p_nom_max" in n.links.columns:
+            n.links.loc[direct_current, "p_nom_max"] = n.links.loc[
+                direct_current, "p_nom"
+            ]
+        logger.info(
+            "DC interconnection is fixed at the operating capacity. Expansion is off."
+        )
+
+
 def apply_temporal_aggregation(
     n: pypsa.Network,
     inputs,
@@ -510,3 +563,4 @@ def main(
         line_max_pu=params.lines["s_max_pu"],
         link_max_pu=params.links["p_max_pu"],
     )
+    keep_operating_interconnectors(n, current_horizon)

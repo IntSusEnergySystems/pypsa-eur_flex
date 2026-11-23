@@ -4,10 +4,11 @@
 """
 Build ``data/agg_p_nom_minmax.csv`` from IEA WEO 2019 Current Policies.
 
-Annex A, Table A.3 (European Union) gives electrical capacity in GW for 2030
-and 2040. Intermediate years are the geometric midpoint of that decade.
-2045 and 2050 continue the same 2030-2040 ratio. WEO 2019 stops at 2040, so
-those two years are an extrapolation, not a published CPS figure.
+Annex A, Table A.3 (European Union) gives electrical capacity in GW. 2018
+is the historical column of that table. 2030 and 2040 are Current Policies.
+2035 is the geometric midpoint of that decade. 2045 and 2050 continue the
+same 2030-2040 ratio. WEO 2019 stops at 2040, so those two years are an
+extrapolation, not a published CPS figure. 2018 is not extrapolated.
 
 The EU total for each technology is shared across the EU-28 countries that
 are in this model (Cyprus and Malta are not) in proportion to that
@@ -40,11 +41,11 @@ from scripts.nuclear_fleet import (
 
 logger = logging.getLogger(__name__)
 
-# IEA WEO 2019, Annex A, Table A.3, European Union, Current Policies, GW.
-# 2018 is the historical column of the same table. 2035, 2045 and 2050 are
-# filled in ``_extend`` from the 2030-2040 ratio.
+# IEA WEO 2019, Annex A, Table A.3, European Union, GW.
+# 2018 is the historical column. 2035, 2045 and 2050 are filled in
+# ``_extend`` from the 2030-2040 ratio and do not use 2018.
 
-HORIZONS = [2030, 2035, 2040, 2045, 2050]
+HORIZONS = [2018, 2030, 2035, 2040, 2045, 2050]
 
 # EU-28 as defined in WEO 2019, minus Cyprus and Malta (not in the model).
 EU_IN_MODEL = {
@@ -107,17 +108,26 @@ NAME_TO_ISO = {
 }
 
 
-def _extend(gw_2030: float, gw_2040: float) -> dict[int, float]:
-    """Fill 2035, 2045 and 2050 from the published 2030 and 2040 values."""
+def _extend(
+    gw_2030: float, gw_2040: float, gw_2018: float | None = None
+) -> dict[int, float]:
+    """Fill 2035, 2045 and 2050 from the published 2030 and 2040 values.
+
+    2018 is the historical column when it is passed in. It does not change
+    the 2030-2040 ratio.
+    """
     ratio = gw_2040 / gw_2030
     step = ratio**0.5
-    return {
+    years = {
         2030: gw_2030,
         2035: gw_2030 * step,
         2040: gw_2040,
         2045: gw_2040 * step,
         2050: gw_2040 * ratio,
     }
+    if gw_2018 is not None:
+        years = {2018: gw_2018, **years}
+    return years
 
 
 def _shares(plants: pd.DataFrame, mask: pd.Series) -> pd.Series:
@@ -158,18 +168,21 @@ def build_limits(plants: pd.DataFrame) -> pd.DataFrame:
     off_gw = plants.loc[offshore, "Capacity"].sum()
     on_frac = on_gw / (on_gw + off_gw)
 
+    # 2018 solar is 115 GW of PV plus 2 GW of CSP, one solar total.
     paths = {
-        "onwind": _extend(286.0 * on_frac, 321.0 * on_frac),
-        "offwind-all": _extend(286.0 * (1 - on_frac), 321.0 * (1 - on_frac)),
-        "solar-all": _extend(213.0, 240.0),
-        "gas": _extend(304.0, 345.0),
-        "coal-all": _extend(112.0, 66.0),
-        "oil": _extend(20.0, 13.0),
+        "onwind": _extend(286.0 * on_frac, 321.0 * on_frac, 180.0 * on_frac),
+        "offwind-all": _extend(
+            286.0 * (1 - on_frac), 321.0 * (1 - on_frac), 180.0 * (1 - on_frac)
+        ),
+        "solar-all": _extend(213.0, 240.0, 117.0),
+        "gas": _extend(304.0, 345.0, 217.0),
+        "coal-all": _extend(112.0, 66.0, 164.0),
+        "oil": _extend(20.0, 13.0, 45.0),
     }
     optional = {
-        "hydro": (hydro, _extend(163.0, 168.0)),
-        "biomass": (biomass, _extend(56.0, 59.0)),
-        "geothermal": (geothermal, _extend(1.0, 2.0)),
+        "hydro": (hydro, _extend(163.0, 168.0, 155.0)),
+        "biomass": (biomass, _extend(56.0, 59.0, 48.0)),
+        "geothermal": (geothermal, _extend(1.0, 2.0, 1.0)),
     }
     country_share = {
         "onwind": wind_on_share,
@@ -219,9 +232,9 @@ def _nuclear_rows(plants: pd.DataFrame) -> list[dict]:
     dated = fill_missing_nuclear_dateout(dated)
     dated = apply_published_nuclear_dates(dated)
     dated = fill_missing_nuclear_dateout(dated)
-    # WEO 2019 Table A.3, European Union, Current Policies: 97 GW in 2030,
-    # 92 GW in 2040. 2018 historical capacity in the same table is 125 GW.
-    targets = _extend(97.0, 92.0)
+    # WEO 2019 Table A.3, European Union. Historical capacity in 2018 is
+    # 125 GW. Current Policies is 97 GW in 2030 and 92 GW in 2040.
+    targets = _extend(97.0, 92.0, 125.0)
     rows = []
     for year, gw in targets.items():
         online = nuclear_online_capacity(dated, year)

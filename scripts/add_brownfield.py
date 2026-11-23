@@ -65,16 +65,19 @@ def add_brownfield(
     """
     logger.info(f"Preparing brownfield for the year {year}")
 
-    # electric transmission grid set optimised capacities of previous as minimum
-    n.lines.s_nom_min = n_p.lines.s_nom_opt
-    # Clamp s_nom_max to be at least s_nom_min to prevent solver infeasibility
-    # from floating-point differences between s_nom_opt and s_nom_max
-    n.lines.s_nom_max = n.lines.s_nom_max.clip(lower=n.lines.s_nom_min)
-    dc_i = n.links[n.links.carrier == "DC"].index
-    n.links.loc[dc_i, "p_nom_min"] = n_p.links.loc[dc_i, "p_nom_opt"]
-    n.links.loc[dc_i, "p_nom_max"] = n.links.loc[dc_i, "p_nom_max"].clip(
-        lower=n.links.loc[dc_i, "p_nom_min"]
-    )
+    # Lines and DC links that are not operating in this horizon are absent.
+    # Keep the ones that are, at the capacity already fixed for this year.
+    if not n.lines.empty and "s_nom_opt" in n_p.lines.columns:
+        carried = n_p.lines["s_nom_opt"].reindex(n.lines.index)
+        n.lines["s_nom_min"] = carried.fillna(n.lines["s_nom"])
+        n.lines["s_nom_max"] = n.lines["s_nom_max"].clip(lower=n.lines["s_nom_min"])
+    dc_i = n.links.index[n.links.carrier == "DC"] if not n.links.empty else []
+    if len(dc_i) and "p_nom_opt" in n_p.links.columns:
+        carried = n_p.links["p_nom_opt"].reindex(dc_i)
+        n.links.loc[dc_i, "p_nom_min"] = carried.fillna(n.links.loc[dc_i, "p_nom"]).to_numpy()
+        n.links.loc[dc_i, "p_nom_max"] = n.links.loc[dc_i, "p_nom_max"].clip(
+            lower=n.links.loc[dc_i, "p_nom_min"]
+        )
 
     for c in n_p.components[["Link", "Generator", "Store"]]:
         if c.static.empty:
