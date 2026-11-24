@@ -67,7 +67,18 @@ def plot_map(
     transmission: bool = False,
     with_legend: bool = True,
 ) -> None:
-    tech_colors = snakemake.params.plotting["tech_colors"]
+    tech_colors = dict(snakemake.params.plotting["tech_colors"])
+    tech_colors.update(
+        {
+            "csp": "#e07a00",
+            "marine": "#167a8a",
+            "coal boiler": "#4e4e4e",
+            "other energy coal": "#3f3f3f",
+            "other energy gas": "#c45100",
+            "other energy oil": "#8a8a8a",
+            "none": "#cccccc",
+        }
+    )
 
     assign_locations(n)
     # Drop non-electric buses so they don't clutter the plot
@@ -108,6 +119,7 @@ def plot_map(
     for item in new_columns:
         if item not in tech_colors:
             logger.warning(f"{item} not in config/plotting/tech_colors")
+            tech_colors[item] = "#b0b0b0"
 
     costs = costs.stack()  # .sort_index()
 

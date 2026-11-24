@@ -5,8 +5,9 @@
 Impose the WEO 2019 Current Policies totals that this model can represent.
 
 Capacity above a country share is derated. Concentrating solar and marine
-are must-run plants with no cost. Combustion CO2 and final energy use the
-published EU totals. Primary oil, gas and coal are only reported.
+produce their published energy with a little spare capacity, so no hour has
+to run. Combustion CO2 and final energy use the published EU totals. Primary
+oil, gas and coal are only reported.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ MBD_TO_MWH = 1e6 * 365.25 / 7.33 * (41.868 / 3.6)
 BCM_TO_MWH = (398.0 / 485.0) * MWH_PER_MTOE
 # 1 tonne of coal equivalent = 0.7 toe. 239 Mtce is the 167 Mtoe coal row.
 MTCE_TO_MWH = 0.7 * MWH_PER_MTOE
+# Spare capacity where the published energy would otherwise fill every hour.
+CAPACITY_SLACK = 0.05
 
 LOAD_GROUPS = {
     ("industry", "coal"): ["coal for industry"],
@@ -195,9 +198,10 @@ def add_csp_and_marine(
     n: pypsa.Network, config: dict, planning_horizons: str | None
 ) -> None:
     """
-    Add must-run concentrating solar and marine at the published GW and TWh.
+    Add concentrating solar and marine at the published annual energy.
 
-    The outlook gives no cost, so capital and marginal cost stay at zero.
+    Capacity sits a little above the gigawatts, and no hour is fixed. The
+    outlook gives no cost, so capital and marginal cost stay at zero.
     Country shares follow solar capacity in the aggregate file.
     """
     spec = config.get("iea_must_run") or {}
@@ -218,24 +222,26 @@ def add_csp_and_marine(
             continue
         if gw <= 0:
             # Table A.3 prints capacity below 0.5 GW as 0. The energy row is
-            # still imposed, at the full-load capacity that can produce it.
+            # still imposed. The installed capacity can produce it without
+            # running every hour.
             gw = twh / 8.76
-            cf = 1.0
             logger.info(
                 "%s is printed as 0 GW. %.3f GW is installed so %.1f TWh can be produced.",
                 carrier,
-                gw,
+                gw * (1 + CAPACITY_SLACK),
                 twh,
             )
-        else:
-            cf = twh / (gw * 8.76)
-            if cf > 1:
-                logger.warning(
-                    "%s needs a capacity factor of %.2f. It is held at 1.",
-                    carrier,
-                    cf,
-                )
-                cf = 1.0
+        elif twh > gw * 8.76:
+            logger.warning(
+                "%s needs %.2f GW at full load for %.1f TWh. The published "
+                "%.1f GW is raised to that.",
+                carrier,
+                twh / 8.76,
+                twh,
+                gw,
+            )
+            gw = twh / 8.76
+        nyears = _nyears(n) or 1.0
         if carrier not in n.carriers.index:
             n.add("Carrier", carrier)
         for code, share in shares.items():
@@ -247,23 +253,28 @@ def add_csp_and_marine(
             name = f"{code} {carrier}"
             if name in n.generators.index:
                 continue
+            annual_mwh = float(share) * twh * 1e6 * nyears
             n.add(
                 "Generator",
                 name,
                 bus=bus,
                 carrier=carrier,
-                p_nom=float(share) * gw * 1000.0,
+                p_nom=float(share) * gw * 1000.0 * (1 + CAPACITY_SLACK),
                 p_nom_extendable=False,
-                p_min_pu=cf,
-                p_max_pu=cf,
+                p_min_pu=0.0,
+                p_max_pu=1.0,
+                e_sum_min=annual_mwh,
+                e_sum_max=annual_mwh,
                 capital_cost=0.0,
                 marginal_cost=0.0,
             )
         logger.info(
-            "%s is must-run at %.1f GW and %.1f TWh, with no cost in the objective.",
+            "%s keeps %.1f TWh for the year. Capacity is %.0f%% above %.1f GW, "
+            "with no cost in the objective.",
             carrier,
-            gw,
             twh,
+            CAPACITY_SLACK * 100,
+            gw,
         )
 
 
@@ -880,14 +891,14 @@ def lift_geothermal_if_energy_exceeds_capacity(
         finite = pd.to_numeric(n.generators.loc[idx, "p_nom_max"], errors="coerce")
         finite = finite.mask(finite.abs() == float("inf"))
         installed = installed.where(finite.isna(), finite)
-    if float(installed.sum()) + 1e-6 >= required_mw:
+    # A little spare capacity, so the annual equality does not fill every hour.
+    target_mw = required_mw * (1 + CAPACITY_SLACK)
+    if float(installed.sum()) + 1e-6 >= target_mw:
         return
     weights = n.generators.loc[idx, "p_nom"].fillna(0.0).clip(lower=0.0)
     if float(weights.sum()) <= 0:
         weights = pd.Series(1.0, index=idx)
-    # Full load sits a little above the published terawatt-hours. The annual
-    # equality is the target, and the plants have to be able to run below it.
-    lifted = weights / float(weights.sum()) * required_mw * (1 + 1e-6)
+    lifted = weights / float(weights.sum()) * target_mw
     n.generators.loc[idx, "p_nom"] = lifted
     n.generators.loc[idx, "p_nom_min"] = lifted
     n.generators.loc[idx, "p_nom_max"] = lifted
@@ -1133,7 +1144,7 @@ def lift_weather_limited_generation(
                 )
             if available >= target:
                 continue
-            scale = target / available * (1 + 1e-6)
+            scale = target / available * (1 + CAPACITY_SLACK)
             n.generators.loc[plants, "p_nom_max"] = (
                 n.generators.loc[plants, "p_nom_max"] * scale
             )
@@ -1170,7 +1181,7 @@ def lift_weather_limited_generation(
                 country_caps.append((str(code), aggregate, cap))
         if not country_caps or available >= target:
             continue
-        scale = target / available * (1 + 1e-6)
+        scale = target / available * (1 + CAPACITY_SLACK)
         for code, aggregate, cap in country_caps:
             override[(code, aggregate)] = (cap, cap * scale)
             plants = n.generators.index[

@@ -491,8 +491,12 @@ def test_marine_2018_installs_the_energy_when_capacity_prints_as_zero(tmp_path):
         },
         "2018",
     )
-    assert n.generators.p_nom.sum() == pytest.approx(1000.0 / 8.76)
-    assert float(n.generators.p_min_pu.iloc[0]) == 1.0
+    from scripts.iea_cps_constraints import CAPACITY_SLACK
+
+    assert n.generators.p_nom.sum() == pytest.approx((1000.0 / 8.76) * (1 + CAPACITY_SLACK))
+    assert float(n.generators.p_min_pu.iloc[0]) == 0.0
+    nyears = float(n.snapshot_weightings.generators.sum()) / 8760.0 or 1.0
+    assert float(n.generators.e_sum_min.iloc[0]) == pytest.approx(1e6 * nyears)
 
 
 def _limit_file(path, rows, year="2030"):
@@ -598,8 +602,12 @@ def test_wind_capacity_rises_when_the_weather_year_is_short(tmp_path):
         },
         "2030",
     )
+    from scripts.iea_cps_constraints import CAPACITY_SLACK
+
     assert n._iea_capacity_override[("DE", "onwind")][0] == pytest.approx(1000.0)
-    assert n._iea_capacity_override[("DE", "onwind")][1] == pytest.approx(2000.0, rel=1e-4)
+    assert n._iea_capacity_override[("DE", "onwind")][1] == pytest.approx(
+        2000.0 * (1 + CAPACITY_SLACK), rel=1e-4
+    )
 
 
 def test_reservoir_inflow_rises_to_the_hydro_total():
@@ -752,9 +760,13 @@ def test_csp_is_must_run_without_cost(tmp_path):
         },
         "2030",
     )
-    assert n.generators.p_nom.sum() == pytest.approx(3000.0)
+    from scripts.iea_cps_constraints import CAPACITY_SLACK
+
+    assert n.generators.p_nom.sum() == pytest.approx(3000.0 * (1 + CAPACITY_SLACK))
     assert n.generators.capital_cost.sum() == 0
-    assert float(n.generators.p_min_pu.iloc[0]) == pytest.approx(8 / (3 * 8.76))
+    assert float(n.generators.p_min_pu.max()) == 0.0
+    nyears = float(n.snapshot_weightings.generators.sum()) / 8760.0 or 1.0
+    assert float(n.generators.e_sum_min.sum()) == pytest.approx(8e6 * nyears)
 
 
 def test_combustion_co2_uses_published_tonnes_and_skips_process():
@@ -1155,9 +1167,11 @@ def test_geothermal_capacity_is_raised_when_energy_exceeds_the_gigawatts(tmp_pat
         "solving": {"agg_p_nom_limits": {"file": path.as_posix()}},
     }
     lift_geothermal_if_energy_exceeds_capacity(n, config, "2030")
-    required = 9 / 8.76 * 1000
+    from scripts.iea_cps_constraints import CAPACITY_SLACK
+
+    required = 9 / 8.76 * 1000 * (1 + CAPACITY_SLACK)
     assert n.generators.p_nom.sum() == pytest.approx(required, rel=1e-5)
-    assert n.generators.p_nom.sum() > required
+    assert n.generators.p_nom.sum() > 9 / 8.76 * 1000
     assert n.generators.p_nom_max.sum() == pytest.approx(n.generators.p_nom.sum())
     assert float(n.generators.p_max_pu.min()) == 1
     assert float(n.generators.p_min_pu.max()) == 0
@@ -1189,11 +1203,11 @@ def test_geothermal_capacity_is_raised_when_energy_exceeds_the_gigawatts(tmp_pat
         p_nom_max=900,
     )
     lift_geothermal_if_energy_exceeds_capacity(short, config, "2040")
-    required_2040 = 12 / 8.76 * 1000
+    required_2040 = 12 / 8.76 * 1000 * (1 + CAPACITY_SLACK)
     assert short.generators.at["DE geo", "p_nom"] == pytest.approx(
         required_2040, rel=1e-5
     )
-    assert short.generators.at["DE geo", "p_nom"] > required_2040
+    assert short.generators.at["DE geo", "p_nom"] > 12 / 8.76 * 1000
 
 
 def test_agriculture_oil_stays_inside_the_other_energy_residual():

@@ -4,7 +4,7 @@
 """
 Build today's industrial production per country and subsector in kt/a.
 
-Physical production per subsector for the configured `industry: reference_year` is read from the JRC-IDEES industry sheets of each EU27 country. The subsectors follow JRC-IDEES: steel (electric arc, integrated steelworks), chemicals (basic, other, pharmaceutical), non-metallic minerals (cement, ceramics, glass), pulp, paper and printing, non-ferrous metals (alumina, primary and secondary aluminium, other), and the index-based sectors food, transport equipment, machinery, textiles, wood and other industry. For countries outside the EU27, the EU27 production is scaled by the ratio of the country's to the EU27's sectoral final energy consumption, taken from the Eurostat energy balances or, for Switzerland, from the [Swiss Federal Office of Energy](https://pubdb.bfe.admin.ch/de/publication/download/11817).
+Physical production per subsector for the configured `industry: reference_year` is read from the JRC-IDEES industry sheets of each EU27 country. The subsectors follow JRC-IDEES: steel (electric arc, integrated steelworks), chemicals (basic, other, pharmaceutical), non-metallic minerals (cement, ceramics, glass), pulp, paper and printing, non-ferrous metals (alumina, primary and secondary aluminium, other), and the index-based sectors food, transport equipment, machinery, textiles, wood and other industry. For countries outside the EU27, the EU27 production is scaled by the ratio of the country's to the EU27's sectoral final energy consumption, taken from the Eurostat energy balances or, for Switzerland, from the [Swiss Federal Office of Energy](https://pubdb.bfe.admin.ch/de/publication/download/11817). If Eurostat has no industry final energy for that country in the reference year, the scale uses the latest earlier year that still reports it.
 
 Basic chemicals are then split: the ammonia production from [build_ammonia_production][] is subtracted, and the remainder is distributed to high-value chemicals, chlorine and methanol in proportion to today's European totals given in the `industry` configuration.
 """
@@ -139,6 +139,45 @@ def find_physical_output(df: pd.DataFrame) -> slice:
     return slice(start, end)
 
 
+def _sector_energy(eurostat, country, year):
+    return (
+        eurostat.query(
+            "year == @year and country == @country and "
+            "siec == 'TOTAL' and nrg_bal in @eb_sectors.keys()"
+        )
+        .set_index("nrg_bal")
+        .value.rename(eb_sectors)
+        .div(ktoe_to_twh)
+    )
+
+
+def _reported_energy_year(country, eurostat, year):
+    """Latest year at or before `year` with Eurostat industry final energy."""
+
+    def reported(y):
+        energy = _sector_energy(eurostat, country, y)
+        return not energy.empty and float(pd.to_numeric(energy, errors="coerce").sum()) > 0
+
+    if reported(year):
+        return year
+    earlier = sorted(
+        int(y)
+        for y in eurostat.loc[eurostat.country == country, "year"].unique()
+        if int(y) < int(year)
+    )
+    for y in reversed(earlier):
+        if reported(y):
+            logger.warning(
+                "%s has no Eurostat industry final energy in %s; "
+                "the production scale uses %s.",
+                country,
+                year,
+                y,
+            )
+            return y
+    return year
+
+
 def get_energy_ratio(country, eurostat, jrc_dir, year, ch_industrial_production):
     if country == "CH":
         # data ranges between 2014-2023
@@ -148,15 +187,8 @@ def get_energy_ratio(country, eurostat, jrc_dir, year, ch_industrial_production)
         e_country *= tj_to_ktoe
     else:
         # estimate physical output, energy consumption in the sector and country
-        e_country = (
-            eurostat.query(
-                "year == @year and country == @country and "
-                "siec == 'TOTAL' and nrg_bal in @eb_sectors.keys()"
-            )
-            .set_index("nrg_bal")
-            .value.rename(eb_sectors)
-            .div(ktoe_to_twh)
-        )
+        year = _reported_energy_year(country, eurostat, year)
+        e_country = _sector_energy(eurostat, country, year)
 
     root = Path(jrc_dir, "EU27")
     fn = next(

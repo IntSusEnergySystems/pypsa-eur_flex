@@ -33,9 +33,22 @@ if __name__ == "__main__":
     n = pypsa.Network(snakemake.input.network)
 
     n.loads.carrier = "load"
+    if "load" not in n.carriers.index:
+        n.add("Carrier", "load")
     n.carriers.loc["load", ["nice_name", "color"]] = "Load", "darkred"
-    colors = n.carriers.set_index("nice_name").color.where(
-        lambda s: s != "", "lightgrey"
+    colors = n.carriers.color.astype("object").replace("", pd.NA).fillna("lightgrey")
+    colors.update(
+        {
+            "csp": "#e07a00",
+            "marine": "#167a8a",
+            "rural coal boiler": "#4e4e4e",
+            "urban decentral coal boiler": "#5a5a5a",
+            "coal boiler": "#4e4e4e",
+            "other energy coal": "#3f3f3f",
+            "other energy gas": "#c45100",
+            "other energy oil": "#8a8a8a",
+            "none": "#cccccc",
+        }
     )
 
     def rename_index(ds: pd.Series) -> pd.Series:
@@ -51,7 +64,7 @@ if __name__ == "__main__":
         if drop_zero:
             ds = ds[ds != 0]
         ds = ds.dropna()
-        c = colors[ds.index.get_level_values("carrier")]
+        c = colors.reindex(ds.index.get_level_values("carrier")).fillna("lightgrey")
         ds = ds.pipe(rename_index)
         label = f"{ds.attrs['name']} [{ds.attrs['unit']}]"
         ds.plot.barh(color=c.values, xlabel=label, ax=ax)

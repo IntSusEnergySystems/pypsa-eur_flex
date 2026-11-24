@@ -12,8 +12,6 @@ change plotted on the left is CO2_year - CO2_2018. 2018 is the baseline, so
 it is not a point on the figure.
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 from pathlib import Path

@@ -20,6 +20,7 @@ existing capacities.
 """
 
 import logging
+import re
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,13 @@ from scripts.add_existing_baseyear import add_build_year_to_new_assets
 
 logger = logging.getLogger(__name__)
 idx = pd.IndexSlice
+_CLUSTERED_COUNTRY = re.compile(r"([A-Z]{2})AC")
+
+
+def _clustered_to_country(name: object) -> str:
+    """ATAC 0 solar becomes AT 0 solar. Northern Ireland joins GB."""
+    text = str(name).replace("GBIAC", "GB")
+    return _CLUSTERED_COUNTRY.sub(r"\1", text)
 
 
 def add_brownfield(
@@ -304,8 +312,21 @@ def adjust_renewable_profiles(n, input_profiles, params, year):
             # temporal_clustering
             p_max_pu = p_max_pu.groupby(snapshotmaps).mean()
 
-            # replace renewable time series
-            n.generators_t.p_max_pu.loc[:, p_max_pu.columns] = p_max_pu
+            # Profile files keep the clustered bus name. The network already
+            # uses the country code, so write onto those generators only.
+            p_max_pu = p_max_pu.rename(columns=_clustered_to_country)
+            counts = p_max_pu.columns.value_counts()
+            unique = counts[counts == 1].index
+            present = unique.intersection(n.generators.index)
+            shared = counts[counts > 1].index.intersection(n.generators.index)
+            if len(shared):
+                logger.info(
+                    "Left the merged %s profile unchanged for %s.",
+                    carrier,
+                    ", ".join(map(str, shared)),
+                )
+            if len(present):
+                n.generators_t.p_max_pu.loc[:, present] = p_max_pu.loc[:, present]
 
 
 def update_heat_pump_efficiency(

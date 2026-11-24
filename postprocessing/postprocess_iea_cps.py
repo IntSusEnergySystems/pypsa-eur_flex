@@ -8,8 +8,6 @@ Reads the solved networks, writes a table, and draws one graph for
 electricity, capacity, combustion CO2 and final energy.
 """
 
-from __future__ import annotations
-
 import argparse
 import logging
 from pathlib import Path
@@ -789,7 +787,11 @@ def run_snakemake(snakemake) -> None:
     networks = snakemake.input.networks
     if isinstance(networks, str):
         networks = [networks]
-    write_report([Path(path) for path in networks], load_config(), Path(snakemake.output.csv).parent)
+    write_report(
+        [Path(path) for path in networks],
+        snakemake.config,
+        Path(snakemake.output.csv).parent,
+    )
 
 
 def main() -> int:
